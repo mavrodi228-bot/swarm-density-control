@@ -4,6 +4,10 @@ meta:
     name: pip
     version: "3.12"
 
+build:
+  requirementsPath: requirements.txt
+  useCache: false
+
 run:
   command: python app.py
   containerPort: 7860
