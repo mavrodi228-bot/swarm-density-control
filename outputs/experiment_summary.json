@@ -1,0 +1,60 @@
+{
+  "flux_mae": 0.00015171663680372532,
+  "flux_corr": 0.5995266667509774,
+  "summary": [
+    {
+      "controller": "Математический эталон",
+      "initial_mae": 0.0008676125638026734,
+      "final_mae": 0.0001690711465616217,
+      "mae_reduction_pct": 80.5130592138273,
+      "final_tv": 0.1947699608389882,
+      "final_com_distance": 0.023132473318724145,
+      "mean_step_ms": 0.6519118099981824
+    },
+    {
+      "controller": "Нейросеть",
+      "initial_mae": 0.0008676125638026734,
+      "final_mae": 0.00013912165967616867,
+      "mae_reduction_pct": 83.96500172076692,
+      "final_tv": 0.1602681519469463,
+      "final_com_distance": 0.03165929934575759,
+      "mean_step_ms": 4.86023548000162
+    },
+    {
+      "controller": "Гибрид 70/30",
+      "initial_mae": 0.0008676125638026734,
+      "final_mae": 0.00012641361874103402,
+      "mae_reduction_pct": 85.42971551875947,
+      "final_tv": 0.1456284887896712,
+      "final_com_distance": 0.02493963504518304,
+      "mean_step_ms": 6.1959103199990295
+    }
+  ],
+  "benchmark": [
+    {
+      "agents": 100,
+      "density_estimation_ms": 0.7351479999897492,
+      "field_control_ms": 3.3273120000103518
+    },
+    {
+      "agents": 1000,
+      "density_estimation_ms": 0.872838000077536,
+      "field_control_ms": 2.9292300000633986
+    },
+    {
+      "agents": 10000,
+      "density_estimation_ms": 2.91722299994035,
+      "field_control_ms": 3.7554430000454886
+    },
+    {
+      "agents": 100000,
+      "density_estimation_ms": 28.20663299996795,
+      "field_control_ms": 4.243772999984685
+    },
+    {
+      "agents": 1000000,
+      "density_estimation_ms": 341.023825000093,
+      "field_control_ms": 5.712156999948093
+    }
+  ]
+}
