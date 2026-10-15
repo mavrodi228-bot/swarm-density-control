@@ -1,0 +1,14 @@
+Swarm Density Control GCS v2
+
+Быстрый запуск Windows:
+1. Установить Python 3.11/3.12.
+2. Открыть папку проекта в терминале.
+3. python -m venv .venv
+4. .venv\Scripts\activate
+5. pip install -r requirements.txt
+6. run_windows.bat   (или python app.py)
+7. Открыть http://127.0.0.1:7860
+
+Начинать следует со вкладки «1. Симулятор миссии».
+Реальные БПЛА сначала проверять в SITL. REAL-команды по умолчанию заблокированы.
+Подробности: README.md.
