@@ -2713,7 +2713,7 @@ button:disabled:hover { color: var(--disabled-text); background: var(--disabled-
   .map-toolbar { left: 15px; top: 42px; flex-direction: row; gap: 1px; padding: 4px; border-radius: 8px; }
   .map-toolbar .icon-button { width: 29px; height: 29px; }
   .toolbar-divider { width: 1px; height: 20px; margin: 4px; }
-  .map-corner { top: 16px; left: 17px; font-size: 10px; }
+  .map-corner { top: 16px; left: 56px; font-size: 10px; }
   .map-empty { padding: 90px 25px 45px; }
   .empty-orbit { width: 48px; height: 48px; outline-offset: 6px; margin-bottom: 20px; border-radius: 13px; }
   .empty-orbit svg { width: 25px; height: 25px; }
