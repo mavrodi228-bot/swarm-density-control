@@ -1,14 +1,10 @@
-Swarm Density Control GCS v2
+AGMEN Mission Control + EDGE
 
-Быстрый запуск Windows:
-1. Установить Python 3.11/3.12.
-2. Открыть папку проекта в терминале.
-3. python -m venv .venv
-4. .venv\Scripts\activate
-5. pip install -r requirements.txt
-6. run_windows.bat   (или python app.py)
-7. Открыть http://127.0.0.1:7860
+Windows: double-click RUN_AGMEN.cmd
+Browser: http://127.0.0.1:7860
+Stop: STOP_AGMEN.cmd
 
-Начинать следует со вкладки «1. Симулятор миссии».
-Реальные БПЛА сначала проверять в SITL. REAL-команды по умолчанию заблокированы.
-Подробности: README.md.
+First installation requires Python 3.12 and Internet.
+After installation the simulator and EDGE run locally offline.
+Read QUICKSTART_RU.md and AGMEN_EDGE.md.
+SIMULATION ONLY: no physical flight commands in the new application.

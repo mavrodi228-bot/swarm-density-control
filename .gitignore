@@ -10,3 +10,12 @@ outputs/scenario_demo.png
 outputs/offline_research_simulation/
 *.log
 .pytest_cache/
+data/
+frontend/node_modules/
+frontend/.vite/
+release/
+.venv-clean/
+.agmen-installed
+test-results/
+*.tsbuildinfo
+.venv-edge/
