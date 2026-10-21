@@ -1453,6 +1453,7 @@ function App() {
                         рассчитывает движение роя…
                       </div>
                     )}
+                  </div>
                     <div className="map-bottom">
                       <div className="map-legend">
                         <span>
@@ -1494,7 +1495,6 @@ function App() {
                         </button>
                       </div>
                     </div>
-                  </div>
                   <div className="playback">
                     <div className="playback-buttons">
                       <IconButton

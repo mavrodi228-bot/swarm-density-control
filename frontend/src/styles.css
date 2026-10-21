@@ -764,10 +764,10 @@ h1 {
   font-family: "Aptos", sans-serif;
 }
 .map-bottom {
-  position: absolute;
-  bottom: 16px;
-  left: 22px;
-  right: 20px;
+  position: static;
+  padding: 8px 16px;
+  background: var(--panel);
+  border-top: 1px solid var(--line-soft);
   display: flex;
   justify-content: space-between;
   gap: 10px;
@@ -2720,7 +2720,7 @@ button:disabled:hover { color: var(--disabled-text); background: var(--disabled-
   .map-empty h3 { font-size: 20px; }
   .map-empty p { font-size: 12px; line-height: 1.65; margin-top: 9px; }
   .map-empty .text-button { margin-top: 12px; font-size: 12px; }
-  .map-bottom { left: 17px; right: 14px; bottom: 12px; }
+  .map-bottom { padding: 8px 12px; gap: 8px; }
   .map-legend { font-size: 9px; gap: 8px; max-width: 72%; }
   .zoom-controls { font-size: 10px; }
   .zoom-controls button { width: 24px; height: 26px; }

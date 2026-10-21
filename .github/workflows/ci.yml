@@ -44,3 +44,9 @@ jobs:
           AGMEN_PYTHON: python
       - run: docker build -t agmen:test .
       - run: docker build -f Dockerfile.edge -t agmen-edge:test .
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: browser-diagnostics
+          path: test-results/
+          retention-days: 3
