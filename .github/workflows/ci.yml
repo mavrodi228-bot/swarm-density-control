@@ -38,6 +38,9 @@ jobs:
           else:
               raise SystemExit('AGMEN healthcheck failed')
           PY
-      - run: npm run test:smoke && npm run test:research
+      - run: npm run test:smoke && npm run test:research && npm run test:connection && npm run test:territory && npm run test:themes
         working-directory: frontend
+        env:
+          AGMEN_PYTHON: python
       - run: docker build -t agmen:test .
+      - run: docker build -f Dockerfile.edge -t agmen-edge:test .

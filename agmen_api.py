@@ -25,6 +25,8 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from agmen_simulation import CONTROLLERS, simulate
+from territory import (MapStore, MapUpload, MapAnalysis, MapCalibration, RestrictedZone,
+                       restricted_mask, mask_rectangles, initial_free_positions)
 
 LOG = logging.getLogger("agmen")
 ROOT = Path(__file__).resolve().parent
@@ -56,6 +58,10 @@ class MissionConfig(BaseModel):
     safe_distance: float = Field(default=1.5, ge=.25, le=8)
     obstacle: Literal["none", "central", "corridor"] = "central"
     targets: list[Target] | None = Field(default=None, min_length=1, max_length=32)
+    map_id: str | None = Field(default=None, pattern=r"^[a-f0-9]{12}$")
+    width_m: float = Field(default=80, ge=10, le=10000)
+    height_m: float = Field(default=60, ge=10, le=10000)
+    restricted_zones: list[RestrictedZone] = Field(default_factory=list, max_length=32)
 
 
 class EventConfig(BaseModel):
@@ -133,6 +139,8 @@ def create_app(state_dir: str | Path | None = None) -> FastAPI:
     data_directory = Path(os.getenv("AGMEN_DATA_DIR", os.getenv("AGMEN_STATE_DIR", str(ROOT / "data"))))
     directory = Path(state_dir) if state_dir is not None else data_directory / "missions"
     directory.mkdir(parents=True, exist_ok=True)
+    maps = MapStore((Path(state_dir) / "maps") if state_dir is not None else data_directory / "maps")
+    app.state.maps = maps
     profile_name = os.getenv("AGMEN_PROFILE", "local").lower()
     if profile_name == "demo":
         profile_name = "public"
@@ -192,11 +200,12 @@ def create_app(state_dir: str | Path | None = None) -> FastAPI:
                         accepted_origins.update({"http://localhost:5173", "http://127.0.0.1:5173"})
                     if origin.rstrip("/") not in accepted_origins:
                         return JSONResponse({"detail": "Cross-origin writes are not permitted."}, status_code=403)
+                body_limit = 8 * 1024 * 1024 if request.method == "POST" and request.url.path == "/api/maps" else 256_000
                 chunks, length = [], 0
                 async for chunk in request.stream():
                     length += len(chunk)
-                    if length > 256_000:
-                        return JSONResponse({"detail": "Request body exceeds 256 KB."}, status_code=413)
+                    if length > body_limit:
+                        return JSONResponse({"detail": f"Request body exceeds {body_limit} bytes."}, status_code=413)
                     chunks.append(chunk)
                 request._body = b"".join(chunks)
         response = await call_next(request)
@@ -222,6 +231,36 @@ def create_app(state_dir: str | Path | None = None) -> FastAPI:
         if config["drone_count"] > limits["max_drones"] or config["steps"] > limits["max_steps"]:
             raise HTTPException(422, f"{profile_name} profile permits at most {limits['max_drones']} drones and {limits['max_steps']} steps")
         _inference(config["controller"], config.get("model_id", "bundled"))
+        if config.get("map_id"):
+            try:
+                snapshot = maps.get(config["map_id"])
+            except FileNotFoundError as error:
+                raise HTTPException(422, "Selected territory is unavailable; upload or select a saved territory") from error
+            config.update(width_m=snapshot["width_m"], height_m=snapshot["height_m"], map_snapshot=snapshot)
+        width, height = config["width_m"], config["height_m"]
+        zones = config.get("restricted_zones") or []
+        for zone in zones:
+            if zone["kind"] == "circle":
+                rx, ry = zone["radius"] * min(width, height) / width, zone["radius"] * min(width, height) / height
+                if zone["x"] < rx or zone["x"] + rx > 1 + 1e-9 or zone["y"] < ry or zone["y"] + ry > 1 + 1e-9:
+                    raise HTTPException(422, "Circle restriction must fit inside the calibrated territory")
+        if zones:
+            from fleet_core import obstacle_mask, obstacle_rectangles
+            from agmen_simulation import GRID, OBSTACLES
+            custom = restricted_mask(zones, GRID, width, height)
+            combined = custom | obstacle_mask(GRID, OBSTACLES[config["obstacle"]])
+            if combined.all():
+                raise HTTPException(422, "Restrictions cover the entire territory")
+            for target in config.get("targets") or []:
+                if custom[min(GRID-1, int(target["y"]*GRID)), min(GRID-1, int(target["x"]*GRID))]:
+                    raise HTTPException(422, "A target lies inside a restricted grid cell; move the target or change the restriction")
+            try:
+                rects = obstacle_rectangles(OBSTACLES[config["obstacle"]], width, height) + mask_rectangles(custom, width, height)
+                if len(rects) > 256:
+                    raise ValueError("Restrictions exceed the planning budget; simplify the shapes")
+                initial_free_positions(config["drone_count"], rects, width, height, config["seed"])
+            except ValueError as error:
+                raise HTTPException(422, str(error)) from error
 
     def memory_admission():
         import psutil
@@ -302,6 +341,49 @@ def create_app(state_dir: str | Path | None = None) -> FastAPI:
                     ("survey", "Обследование"), ("scan", "Сканирование"), ("return", "Возврат")]],
                 "missions": list_missions()}
 
+    @app.get("/api/maps")
+    def list_maps():
+        return maps.list()
+
+    @app.post("/api/maps", status_code=201)
+    def upload_map(upload: MapUpload):
+        try:
+            return maps.create(upload)
+        except ValueError as error:
+            raise HTTPException(422, str(error)) from error
+        except OSError as error:
+            raise HTTPException(507, "Unable to save territory; check disk space and data directory") from error
+
+    @app.get("/api/maps/{identifier}")
+    def get_map(identifier: str):
+        try:
+            return maps.get(identifier)
+        except FileNotFoundError as error:
+            raise HTTPException(404, "Territory not found") from error
+
+    @app.get("/api/maps/{identifier}/image")
+    def map_image(identifier: str):
+        get_map(identifier)
+        return FileResponse(maps.image_path(identifier), media_type="image/png", headers={"Cache-Control": "private, max-age=3600"})
+
+    @app.post("/api/maps/{identifier}/analyze")
+    def analyze_map(identifier: str, settings: MapAnalysis):
+        try:
+            return maps.analyze(identifier, settings)
+        except FileNotFoundError as error:
+            raise HTTPException(404, "Territory not found") from error
+        except OSError as error:
+            raise HTTPException(507, "Unable to update territory analysis") from error
+
+    @app.post("/api/maps/{identifier}/calibrate")
+    def calibrate_map(identifier: str, dimensions: MapCalibration):
+        try:
+            return maps.calibrate(identifier, dimensions)
+        except FileNotFoundError as error:
+            raise HTTPException(404, "Territory not found") from error
+        except OSError as error:
+            raise HTTPException(507, "Unable to save territory dimensions") from error
+
     @app.get("/api/missions")
     def list_missions():
         with lock:
@@ -369,12 +451,13 @@ def create_app(state_dir: str | Path | None = None) -> FastAPI:
             import matplotlib.pyplot as plt
             fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
             frames, history = record["frames"], record["history"]
-            axes[0].imshow(frames[-1]["density"], origin="lower", extent=[0, 80, 0, 60], cmap="Blues", aspect="auto")
+            width, height = record["workspace"]["width_m"], record["workspace"]["height_m"]
+            axes[0].imshow(frames[-1]["density"], origin="upper", extent=[0, width, height, 0], cmap="Blues", aspect="auto")
             for i in range(record["config"]["drone_count"]):
-                axes[0].plot([f["agents"][i]["x"] * 80 for f in frames], [f["agents"][i]["y"] * 60 for f in frames], alpha=.35, linewidth=.65)
+                axes[0].plot([f["agents"][i]["x"] * width for f in frames], [f["agents"][i]["y"] * height for f in frames], alpha=.35, linewidth=.65)
             for rect in record["obstacle_rects"]:
                 from matplotlib.patches import Rectangle
-                axes[0].add_patch(Rectangle((rect["x"]*80, rect["y"]*60), rect["width"]*80, rect["height"]*60, color="#333333"))
+                axes[0].add_patch(Rectangle((rect["x"]*width, rect["y"]*height), rect["width"]*width, rect["height"]*height, color="#333333"))
             axes[0].set(xlabel="X (m)", ylabel="Y (m)", title="Simulated trajectories and final density")
             axes[1].plot([h["time"] for h in history], [h["tv_distance"] for h in history], label="Total variation distance")
             axes[1].set(xlabel="Simulation time (s)", ylabel="Density error", title=f"{record['config']['controller']} / {record['config']['drone_count']} virtual UAVs")

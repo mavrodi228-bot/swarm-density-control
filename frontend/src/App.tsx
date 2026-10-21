@@ -1,5 +1,8 @@
 import { cloneElement, isValidElement, useEffect, useRef, useState } from "react";
 import type { ReactElement, ReactNode } from "react";
+import { api, download, CONNECTION_EVENT, ApiError } from "./api";
+import { useTerritory, TerritoryPanel, TerritoryBackground, TerritoryLayers } from "./TerritoryMap";
+import type { RestrictedZone } from "./TerritoryMap";
 import {
   Activity,
   ArrowDownToLine,
@@ -75,6 +78,10 @@ type Config = {
   obstacle: string;
   targets?: Zone[];
   model_id?: string;
+  map_id?: string | null;
+  restricted_zones?: RestrictedZone[];
+  width_m?: number;
+  height_m?: number;
 };
 type Zone = { x: number; y: number; radius: number; weight: number };
 type Mission = {
@@ -88,6 +95,7 @@ type Mission = {
   history?: Record<string, number>[];
   events?: Record<string, unknown>[];
   summary?: Record<string, number | boolean>;
+  workspace?: { width_m: number; height_m: number };
   error?: string;
 };
 type Bootstrap = {
@@ -112,6 +120,7 @@ type Run = {
   config?: Record<string, unknown>;
 };
 type Device = {
+  workspace?: { width_m: number; height_m: number };
   id: string;
   status: string;
   job_status: string;
@@ -182,45 +191,6 @@ const labels: Record<string, string> = {
 };
 const fmt = (n: unknown, d = 2) =>
   typeof n === "number" && Number.isFinite(n) ? n.toFixed(d) : "—";
-function authHeaders(): Record<string, string> {
-  const token = sessionStorage.getItem("agmen-token");
-  return token ? { "X-AGMEN-Token": token } : {};
-}
-async function api<T>(path: string, body?: unknown): Promise<T> {
-  const r = await fetch(path, {
-    method: body === undefined ? "GET" : "POST",
-    headers: {
-      ...authHeaders(),
-      ...(body === undefined ? {} : { "Content-Type": "application/json" }),
-    },
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
-  if (!r.ok) {
-    const t = await r.text();
-    let m = t;
-    try {
-      const j = JSON.parse(t);
-      m =
-        typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail ?? j);
-    } catch {
-      /* text error */
-    }
-    throw new Error(m || `HTTP ${r.status}`);
-  }
-  return r.json();
-}
-async function download(path: string, name: string) {
-  const r = await fetch(path, { headers: authHeaders() });
-  if (!r.ok) throw new Error(`Ошибка экспорта: HTTP ${r.status}`);
-  const url = URL.createObjectURL(await r.blob());
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = name;
-  document.body.append(a);
-  a.click();
-  a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 3000);
-}
 function IconButton({
   title,
   onClick,
@@ -270,7 +240,7 @@ function Field({
 function Chart({
   data,
   keys = ["mae"],
-  colors = ["#3bd8d0", "#7187ff"],
+  colors = ["var(--accent)", "var(--secondary)"],
   height = 150,
 }: {
   data: Record<string, number>[];
@@ -367,8 +337,8 @@ function Chart({
 
 function App() {
   const [page, setPage] = useState("mission");
-  const [theme, setTheme] = useState(
-    localStorage.getItem("agmen-theme") || "dark",
+  const [theme, setTheme] = useState(() =>
+    localStorage.getItem("agmen-theme") === "dark" ? "dark" : "light",
   );
   const [pro, setPro] = useState(localStorage.getItem("agmen-pro") === "true");
   const [boot, setBoot] = useState<Bootstrap | null>(null);
@@ -378,6 +348,13 @@ function App() {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [online, setOnline] = useState(false);
+  const hasTerrainDraft = useRef(localStorage.getItem("agmen-territory") !== null);
+  const territory = useTerritory(setError, online, (reason) => {
+    setMission(null); setPlaying(false); setFrameIndex(0);
+    if (reason === "map") { setConfig(current => ({ ...current, obstacle: "none" })); setZones([]); }
+  });
+  const [reconnecting, setReconnecting] = useState(true);
+  const [connectionIssue, setConnectionIssue] = useState("");
   const [frameIndex, setFrameIndex] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [speed, setSpeed] = useState(1);
@@ -394,7 +371,9 @@ function App() {
   const [fleetExpanded, setFleetExpanded] = useState(false);
   const [help, setHelp] = useState(false);
   const [toast, setToast] = useState("");
-  const started = useRef(false);
+  const reconnect = useRef<() => void>(() => {});
+  const missionRef = useRef(mission);
+  missionRef.current = mission;
   const mapRef = useRef<SVGSVGElement | null>(null);
   const drag = useRef<{ x: number; y: number } | null>(null);
   const [drawing, setDrawing] = useState<Zone | null>(null);
@@ -449,38 +428,101 @@ function App() {
     localStorage.setItem("agmen-pro", String(pro));
   }, [pro]);
   useEffect(() => {
-    if (started.current) return;
-    started.current = true;
-    (async () => {
+    let live = true;
+    let connected = false;
+    let initialized = false;
+    let checking = false;
+    let failures = 0;
+    let timer: ReturnType<typeof setTimeout>;
+    const schedule = (delay: number) => {
+      clearTimeout(timer);
+      timer = setTimeout(check, delay);
+    };
+    const check = async () => {
+      if (!live || checking) return;
+      checking = true;
+      if (!connected) setReconnecting(true);
       try {
-        const b = await api<Bootstrap>("/api/bootstrap");
-        setBoot(b);
-        setMissions(b.missions || []);
-        setOnline(true);
-        const saved = localStorage.getItem("agmen-mission");
-        const initial =
-          b.missions?.find((m) => m.id === saved) || b.missions?.[0];
-        if (initial) {
-          const m = await api<Mission>(`/api/missions/${initial.id}`);
-          setMission(m);
-          if (m.config) {
-            setConfig(m.config);
-            setZones(m.config.targets || []);
+        await api("/api/health", undefined, { timeoutMs: 2500, retries: 0 });
+        if (!connected) {
+          const b = await api<Bootstrap>("/api/bootstrap", undefined, { timeoutMs: 8000, retries: 0 });
+          if (!live) return;
+          setBoot(b);
+          setMissions(b.missions || []);
+          const current = missionRef.current;
+          const saved = current?.id || localStorage.getItem("agmen-mission");
+          const initial = b.missions?.find((m) => m.id === saved) || (!initialized ? b.missions?.[0] : undefined);
+          if (initial) {
+            const m = await api<Mission>(`/api/missions/${initial.id}`);
+            if (!live) return;
+            const sameTerritory = !hasTerrainDraft.current || (
+              territory.mapId === (m.config?.map_id || null) &&
+              JSON.stringify(territory.shapes, ["kind", "x", "y", "width", "height", "radius", "points"]) ===
+                JSON.stringify(m.config?.restricted_zones || [], ["kind", "x", "y", "width", "height", "radius", "points"]) &&
+              (!m.workspace || (territory.width === m.workspace.width_m && territory.height === m.workspace.height_m))
+            );
+            if (initialized || current || sameTerritory) setMission(m);
+            // Reconnection updates results while preserving edits in the mission form.
+            if (!initialized && !current && sameTerritory && m.config) {
+              setConfig(m.config);
+              setZones(m.config.targets || []);
+              if (!hasTerrainDraft.current) territory.restore(m.config.map_id, m.config.restricted_zones, m.workspace);
+            }
           }
+          initialized = true;
         }
+        if (!live) return;
+        connected = true;
+        failures = 0;
+        setOnline(true);
+        setConnectionIssue("");
+        setError((previous) => previous.includes("/api/") ? "" : previous);
       } catch (e) {
-        setError(String((e as Error).message));
+        if (!live) return;
+        connected = false;
+        failures += 1;
         setOnline(false);
+        setConnectionIssue((e as Error).message);
+      } finally {
+        checking = false;
+        if (live) {
+          setReconnecting(false);
+          schedule(connected ? 5000 : Math.min(15000, 1000 * 2 ** Math.min(failures - 1, 4)));
+        }
       }
-    })();
+    };
+    const retry = () => {
+      failures = 0;
+      connected = false;
+      if (!checking) void check();
+    };
+    const lost = (event: Event) => {
+      const issue = (event as CustomEvent<ApiError>).detail;
+      connected = false;
+      setOnline(false);
+      setConnectionIssue(issue.message);
+      setPlaying(false);
+      if (!checking) schedule(1000);
+    };
+    reconnect.current = retry;
+    window.addEventListener(CONNECTION_EVENT, lost);
+    window.addEventListener("online", retry);
+    void check();
+    return () => {
+      live = false;
+      clearTimeout(timer);
+      window.removeEventListener(CONNECTION_EVENT, lost);
+      window.removeEventListener("online", retry);
+    };
   }, []);
   useEffect(() => {
-    if (!mission?.id || !calculating) return;
+    if (!mission?.id || !calculating || !online) return;
     const t = setInterval(async () => {
       try {
         const m = await api<Mission>(`/api/missions/${mission.id}`);
         setMission(m);
         if (m.status === "completed") {
+          if (m.config) territory.restore(m.config.map_id, m.config.restricted_zones, m.workspace);
           setFrameIndex(0);
           setPlaying(true);
           setMissions((prev) => [m, ...prev.filter((x) => x.id !== m.id)]);
@@ -492,7 +534,7 @@ function App() {
       }
     }, 900);
     return () => clearInterval(t);
-  }, [mission?.id, calculating]);
+  }, [mission?.id, calculating, online]);
   useEffect(() => {
     if (!playing || frames.length < 2) return;
     const t = setInterval(
@@ -514,7 +556,7 @@ function App() {
     return () => clearTimeout(t);
   }, [toast]);
   useEffect(() => {
-    if (page !== "lab") return;
+    if (page !== "lab" || !online) return;
     let live = true;
     const refresh = async () => {
       try {
@@ -539,9 +581,9 @@ function App() {
       live = false;
       clearInterval(t);
     };
-  }, [page]);
+  }, [page, online]);
   useEffect(() => {
-    if (page !== "edge") return;
+    if (page !== "edge" || !online) return;
     let live = true;
     const refresh = async () => {
       try {
@@ -559,7 +601,7 @@ function App() {
       live = false;
       clearInterval(t);
     };
-  }, [page]);
+  }, [page, online]);
   useEffect(() => {
     if (page !== "mission" || !online) return;
     api<Record<string, unknown>[]>("/api/lab/models")
@@ -574,7 +616,7 @@ function App() {
   }, [page, online]);
   useEffect(() => {
     if (
-      !experiment?.id ||
+      !online || !experiment?.id ||
       !["queued", "running"].includes(String(experiment.status))
     )
       return;
@@ -586,10 +628,10 @@ function App() {
       1500,
     );
     return () => clearInterval(t);
-  }, [experiment?.id, experiment?.status]);
+  }, [experiment?.id, experiment?.status, online]);
   useEffect(() => {
     if (
-      !optimization?.id ||
+      !online || !optimization?.id ||
       !["queued", "running"].includes(String(optimization.status))
     )
       return;
@@ -601,31 +643,50 @@ function App() {
       1500,
     );
     return () => clearInterval(t);
-  }, [optimization?.id, optimization?.status]);
+  }, [optimization?.id, optimization?.status, online]);
   useEffect(() => {
-    if (page !== "analytics" || !pro) return;
+    if (page !== "analytics" || !pro || !online) return;
     api<Record<string, unknown>[]>("/api/experiments")
       .then((s) => setExperiment((e) => e || s[0] || null))
       .catch(() => {});
     api<Record<string, unknown>[]>("/api/optimization")
       .then((s) => setOptimization((e) => e || s[0] || null))
       .catch(() => {});
-  }, [page, pro]);
+  }, [page, pro, online]);
   async function createMission() {
     setError("");
     setBusy(true);
     setPlaying(false);
     try {
       const m = await api<Mission>("/api/missions", {
-        ...config,
+        name: config.name,
+        drone_count: config.drone_count,
+        controller: config.controller,
+        model_id: config.model_id || "bundled",
+        scenario: config.scenario,
+        steps: config.steps,
+        seed: config.seed,
+        max_speed: config.max_speed,
+        safe_distance: config.safe_distance,
+        obstacle: config.obstacle,
         targets: zones.length ? zones : undefined,
+        map_id: territory.mapId,
+        restricted_zones: territory.shapes,
+        width_m: territory.width,
+        height_m: territory.height,
       });
       setMission(m);
+      if (m.config) territory.restore(m.config.map_id, m.config.restricted_zones, m.workspace || {
+        width_m: m.config.width_m || 80, height_m: m.config.height_m || 60,
+      });
       setFrameIndex(0);
       setSelected([]);
       localStorage.setItem("agmen-mission", m.id);
       setMissions((prev) => [m, ...prev.filter((x) => x.id !== m.id)]);
-      if (m.status === "completed") setPlaying(true);
+      if (m.status === "completed") {
+        if (m.config) territory.restore(m.config.map_id, m.config.restricted_zones, m.workspace);
+        setPlaying(true);
+      }
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -641,6 +702,7 @@ function App() {
       if (m.config) {
         setConfig(m.config);
         setZones(m.config.targets || []);
+        territory.restore(m.config.map_id, m.config.restricted_zones, m.workspace);
       }
       localStorage.setItem("agmen-mission", id);
     } catch (e) {
@@ -683,6 +745,8 @@ function App() {
     };
   }
   function startDraw(e: React.PointerEvent<SVGSVGElement>) {
+    if (calculating || !online || territory.busy) return;
+    if (territory.down(point(e), e)) return;
     if (tool !== "target") return;
     const p = point(e);
     drag.current = p;
@@ -690,6 +754,7 @@ function App() {
     e.currentTarget.setPointerCapture(e.pointerId);
   }
   function finishDraw() {
+    territory.up();
     if (drag.current && drawing) {
       if (zones.length >= 32) setError("Достигнут предел: 32 целевые зоны");
       else {
@@ -805,9 +870,9 @@ function App() {
             </strong>
           </div>
           <div className="top-actions">
-            <span className={`engine-status ${online ? "" : "disconnected"}`}>
+            <span className={`engine-status ${online ? "" : "disconnected"}`} role="status" title="Соединение браузера с локальным сервером AGMEN; не связано с интернетом EDGE">
               <i />
-              {online ? "LOCAL ENGINE" : "НЕТ СОЕДИНЕНИЯ"}
+              {online ? "LOCAL ENGINE" : reconnecting ? "ПОДКЛЮЧЕНИЕ…" : "НЕТ СОЕДИНЕНИЯ"}
             </span>
             <div className="mode-switch">
               <button
@@ -870,13 +935,14 @@ function App() {
               <span className="version">WORKSPACE / 01</span>
             </div>
           </div>
-          {error && (
+          {(connectionIssue || error) && (
             <div role="alert" className="error-banner">
               <TriangleAlert size={18} />
-              <span>{error}</span>
-              <button onClick={() => setError("")} aria-label="Закрыть ошибку">
-                <X size={16} />
+              <span>{connectionIssue || error}{!online && mission ? " Показаны ранее загруженные результаты." : ""}</span>
+              <button className="secondary-button small" onClick={() => reconnect.current()} disabled={reconnecting}>
+                <RotateCcw size={14} /> {reconnecting ? "Подключение…" : "Повторить подключение"}
               </button>
+              {!connectionIssue && <button onClick={() => setError("")} aria-label="Закрыть ошибку"><X size={16} /></button>}
             </div>
           )}
           {page === "mission" && (
@@ -938,7 +1004,7 @@ function App() {
                       <span className="title-dot" />
                       Поле миссии
                       <span className="subtle">
-                        Локальная плоскость · 80 × 60 m
+                        Локальная плоскость · {territory.width} × {territory.height} м
                       </span>
                     </div>
                     <div className="map-header-actions">
@@ -969,21 +1035,22 @@ function App() {
                       </IconButton>
                     </div>
                   </div>
+                  <TerritoryPanel editor={territory} disabled={calculating || !online} onActivate={() => setTool("select")} />
                   <div
-                    className={`map-viewport ${tool === "target" ? "draw-mode" : ""}`}
+                    className={`map-viewport ${tool === "target" || territory.tool !== "select" ? "draw-mode" : ""}`}
                   >
                     <div className="map-toolbar">
                       <IconButton
                         title="Выбрать аппарат"
                         active={tool === "select"}
-                        onClick={() => setTool("select")}
+                        onClick={() => { setTool("select"); territory.activate("select"); }}
                       >
                         <MousePointer2 size={17} />
                       </IconButton>
                       <IconButton
                         title="Нарисовать целевую зону: протяните мышью"
                         active={tool === "target"}
-                        onClick={() => setTool("target")}
+                        onClick={() => { setTool("target"); territory.activate("select"); }}
                       >
                         <Crosshair size={18} />
                       </IconButton>
@@ -1039,6 +1106,8 @@ function App() {
                       aria-label="Интерактивное поле симуляции"
                       onPointerDown={startDraw}
                       onPointerMove={(e) => {
+                        if (calculating || !online || territory.busy) return;
+                        territory.move(point(e));
                         if (drag.current) {
                           const p = point(e);
                           setDrawing({
@@ -1058,6 +1127,12 @@ function App() {
                         }
                       }}
                       onPointerUp={finishDraw}
+                      onPointerCancel={() => territory.activate("select")}
+                      tabIndex={0}
+                      onKeyDown={(e) => {
+                        if (e.key === "Escape") territory.activate("select");
+                        if (e.key === "Enter" && territory.tool === "polygon" && !calculating && online && !territory.busy) { e.preventDefault(); territory.finishPolygon(); }
+                      }}
                     >
                       <defs>
                         <pattern
@@ -1077,12 +1152,12 @@ function App() {
                         <radialGradient id="zoneGlow">
                           <stop
                             offset="0"
-                            stopColor="#30d3cd"
+                            stopColor="var(--target-color)"
                             stopOpacity=".25"
                           />
                           <stop
                             offset="1"
-                            stopColor="#30d3cd"
+                            stopColor="var(--target-color)"
                             stopOpacity="0"
                           />
                         </radialGradient>
@@ -1098,7 +1173,7 @@ function App() {
                             y1="0"
                             x2="0"
                             y2="8"
-                            stroke="#dfa36b"
+                            stroke="var(--warning)"
                             strokeWidth="1"
                             opacity=".35"
                           />
@@ -1124,7 +1199,7 @@ function App() {
                             fontSize="10"
                             textAnchor="middle"
                           >
-                            {i * 10}
+                            {Math.round((i * territory.width) / 8)}
                           </text>
                           {i < 7 && (
                             <text
@@ -1134,7 +1209,7 @@ function App() {
                               fontSize="10"
                               textAnchor="end"
                             >
-                              {i * 10}
+                              {Math.round((i * territory.height) / 6)}
                             </text>
                           )}
                         </g>
@@ -1149,6 +1224,7 @@ function App() {
                         clipPath="url(#plot)"
                         transform={`translate(${484 * (1 - mapZoom)},${317 * (1 - mapZoom)}) scale(${mapZoom})`}
                       >
+                        <TerritoryBackground editor={territory} />
                         {layers.target &&
                           (frame?.target || mission?.target)?.flatMap(
                             (row, y) =>
@@ -1163,7 +1239,7 @@ function App() {
                                     y={28 + (y * 578) / matrix.length}
                                     width={880 / row.length + 0.3}
                                     height={578 / matrix.length + 0.3}
-                                    fill="#24c7ba"
+                                    fill="var(--target-color)"
                                     opacity={Math.min(0.36, (v / max) * 0.36)}
                                   />
                                 ) : null;
@@ -1183,7 +1259,7 @@ function App() {
                                   y={28 + (y * 578) / frame.density.length}
                                   width={880 / row.length + 0.3}
                                   height={578 / frame.density.length + 0.3}
-                                  fill="#6d8cff"
+                                  fill="var(--density-color)"
                                   opacity={Math.min(0.55, (v / max) * 0.55)}
                                 />
                               ) : null;
@@ -1197,19 +1273,19 @@ function App() {
                               width={o.width * 880}
                               height={o.height * 578}
                               fill="url(#obstacle)"
-                              stroke="#b17f4d"
+                              stroke="var(--warning)"
                               strokeDasharray="4 3"
                               opacity=".75"
                             />
-                            <text
+                            {!mission.config?.restricted_zones?.length && <text
                               x={44 + (o.x + o.width / 2) * 880}
                               y={28 + (o.y + o.height / 2) * 578}
-                              fill="#cd9a66"
+                              fill="var(--warning)"
                               fontSize="8"
                               textAnchor="middle"
                             >
                               NO-FLY
-                            </text>
+                            </text>}
                           </g>
                         ))}
                         {zones.map((z, i) => (
@@ -1220,7 +1296,7 @@ function App() {
                               rx={z.radius * 880}
                               ry={z.radius * 578}
                               fill="url(#zoneGlow)"
-                              stroke="#44d5cb"
+                              stroke="var(--target-color)"
                               strokeDasharray="5 4"
                               strokeWidth="1.2"
                             />
@@ -1228,7 +1304,7 @@ function App() {
                               x={44 + z.x * 880}
                               y={28 + z.y * 578}
                               textAnchor="middle"
-                              fill="#67e5da"
+                              fill="var(--target-color)"
                               fontSize="10"
                             >
                               ЗОНА {i + 1}
@@ -1242,10 +1318,11 @@ function App() {
                             rx={drawing.radius * 880}
                             ry={drawing.radius * 578}
                             fill="url(#zoneGlow)"
-                            stroke="#44d5cb"
+                            stroke="var(--target-color)"
                             strokeDasharray="4 4"
                           />
                         )}
+                        <TerritoryLayers editor={territory} />
                         {layers.trails &&
                           frame?.agents.map((a, i) => (
                             <polyline
@@ -1263,7 +1340,7 @@ function App() {
                                 .join(" ")}
                               fill="none"
                               stroke={
-                                selected.includes(a.id) ? "#e5ffff" : "#36a5a9"
+                                selected.includes(a.id) ? "var(--drone-selected)" : "var(--map-trail)"
                               }
                               strokeWidth={selected.includes(a.id) ? 1.8 : 0.8}
                               opacity={selected.includes(a.id) ? 0.75 : 0.38}
@@ -1302,8 +1379,8 @@ function App() {
                             {selected.includes(a.id) && (
                               <circle
                                 r="12"
-                                fill="#4ac8d01a"
-                                stroke="#8cf6ed"
+                                fill="var(--drone-selection-fill)"
+                                stroke="var(--drone-selected)"
                                 strokeWidth="1"
                               />
                             )}
@@ -1313,7 +1390,7 @@ function App() {
                                 y1="0"
                                 x2={Math.cos(a.heading) * a.speed * 10}
                                 y2={Math.sin(a.heading) * a.speed * 10}
-                                stroke="#77e1db"
+                                stroke="var(--drone-color)"
                                 strokeWidth="1"
                                 opacity=".7"
                               />
@@ -1325,12 +1402,12 @@ function App() {
                                 d="M0 -6.5 4.5 5 0 2.8 -4.5 5Z"
                                 fill={
                                   a.status === "failed"
-                                    ? "#f27878"
+                                    ? "var(--danger)"
                                     : a.link === "lost"
-                                      ? "#f3bd70"
+                                      ? "var(--warning)"
                                       : selected.includes(a.id)
-                                        ? "#edffff"
-                                        : "#71e1d8"
+                                        ? "var(--drone-selected)"
+                                        : "var(--drone-color)"
                                 }
                                 stroke="var(--map-bg)"
                                 strokeWidth=".8"
@@ -1338,14 +1415,14 @@ function App() {
                               <path
                                 d="M-6 1H6M-3 -3 3 5M3 -3 -3 5"
                                 stroke={
-                                  a.status === "failed" ? "#f27878" : "#71e1d8"
+                                  a.status === "failed" ? "var(--danger)" : "var(--drone-color)"
                                 }
                                 strokeWidth=".7"
                                 opacity=".8"
                               />
                             </g>
                             {selected.includes(a.id) && (
-                              <text x="15" y="-8" fill="#bcfffa" fontSize="9">
+                              <text x="15" y="-8" fill="var(--drone-selected)" fontSize="9">
                                 UAV-{String(a.id).padStart(3, "0")}
                               </text>
                             )}
@@ -1827,7 +1904,7 @@ function App() {
                                   </span>
                                 </td>
                                 <td className="mono">
-                                  {fmt(a.x * 80, 1)} / {fmt(a.y * 60, 1)}
+                                  {fmt(a.x * territory.width, 1)} / {fmt(a.y * territory.height, 1)}
                                 </td>
                                 <td className="mono">
                                   {fmt(a.speed, 2)}{" "}
@@ -2009,11 +2086,11 @@ function App() {
                       </div>
                       <div className="chart-key">
                         <span>
-                          <i style={{ background: "#3bd8d0" }} />
+                          <i style={{ background: "var(--accent)" }} />
                           Train loss
                         </span>
                         <span>
-                          <i style={{ background: "#7187ff" }} />
+                          <i style={{ background: "var(--secondary)" }} />
                           Validation loss
                         </span>
                       </div>
@@ -2521,7 +2598,7 @@ function App() {
                             </div>
                             <p>
                               {device.telemetry
-                                ? `X ${fmt(device.telemetry.x * 80, 2)} m  /  Y ${fmt(device.telemetry.y * 60, 2)} m  ·  Заряд ${fmt(device.telemetry.battery, 1)}%  ·  Шаг ${device.telemetry.step}`
+                                ? `X ${fmt(device.telemetry.x * (device.workspace?.width_m || 80), 2)} m  /  Y ${fmt(device.telemetry.y * (device.workspace?.height_m || 60), 2)} m  ·  Заряд ${fmt(device.telemetry.battery, 1)}%  ·  Шаг ${device.telemetry.step}`
                                 : "Нет подтверждённых координат"}
                             </p>
                             {device.telemetry_kind !== "confirmed" && (
@@ -2874,7 +2951,7 @@ function App() {
                     <div className="chart-title">
                       <h3>Сходимость распределения</h3>
                       <span className="chart-key">
-                        <i style={{ background: "#3bd8d0" }} /> MAE
+                        <i style={{ background: "var(--accent)" }} /> MAE
                       </span>
                     </div>
                     <Chart data={mission?.history || []} height={225} />
@@ -2925,7 +3002,7 @@ function App() {
                     <Chart
                       data={mission?.history || []}
                       keys={["tv_distance"]}
-                      colors={["#7187ff"]}
+                      colors={["var(--secondary)"]}
                       height={180}
                     />
                   </div>
@@ -2939,7 +3016,7 @@ function App() {
                     <Chart
                       data={mission?.history || []}
                       keys={["compute_ms"]}
-                      colors={["#e1b77e"]}
+                      colors={["var(--warning)"]}
                       height={180}
                     />
                   </div>
@@ -3142,17 +3219,7 @@ function App() {
                       className="secondary-button small"
                       onClick={async () => {
                         sessionStorage.setItem("agmen-token", token);
-                        try {
-                          const b = await api<Bootstrap>("/api/bootstrap");
-                          setBoot(b);
-                          setMissions(b.missions || []);
-                          setOnline(true);
-                          setError("");
-                          setToast("Соединение с сервером установлено");
-                        } catch (e) {
-                          setOnline(false);
-                          setError((e as Error).message);
-                        }
+                        reconnect.current();
                       }}
                     >
                       Подключить
@@ -3201,7 +3268,7 @@ function App() {
                   </div>
                   <div>
                     <dt>Размер области</dt>
-                    <dd>80 × 60 метров</dd>
+                    <dd>{territory.width} × {territory.height} метров</dd>
                   </div>
                   <div>
                     <dt>Математика</dt>
@@ -3330,7 +3397,7 @@ function EdgeMap({ device }: { device: Device }) {
     <div className="edge-map">
       <div className="edge-map-label">
         <Crosshair size={13} />
-        Наблюдение наземной станции<span>80 × 60 m</span>
+        Наблюдение наземной станции<span>{device.workspace?.width_m || 80} × {device.workspace?.height_m || 60} м</span>
       </div>
       <svg
         viewBox="0 0 600 230"
@@ -3370,18 +3437,18 @@ function EdgeMap({ device }: { device: Device }) {
                 r="9"
                 fill={
                   device.telemetry_kind === "confirmed"
-                    ? "#3bd8d020"
-                    : "#d6a45c16"
+                    ? "var(--drone-selection-fill)"
+                    : "var(--drone-selection-fill)"
                 }
                 stroke={
-                  device.telemetry_kind === "confirmed" ? "#3bd8d0" : "#d6a45c"
+                  device.telemetry_kind === "confirmed" ? "var(--accent)" : "var(--warning)"
                 }
                 strokeWidth="1.3"
               />
               <circle
                 r="3"
                 fill={
-                  device.telemetry_kind === "confirmed" ? "#3bd8d0" : "#d6a45c"
+                  device.telemetry_kind === "confirmed" ? "var(--accent)" : "var(--warning)"
                 }
               />
             </g>
@@ -3391,17 +3458,17 @@ function EdgeMap({ device }: { device: Device }) {
               transform={`translate(${20 + estimate.x * 560},${10 + estimate.y * 200})`}
             >
               <ellipse
-                rx={Math.min(180, (estimate.uncertainty_m / 80) * 560)}
-                ry={Math.min(85, (estimate.uncertainty_m / 60) * 200)}
-                fill="#d6a45c08"
-                stroke="#bc9c62"
+                rx={Math.min(180, (estimate.uncertainty_m / (device.workspace?.width_m || 80)) * 560)}
+                ry={Math.min(85, (estimate.uncertainty_m / (device.workspace?.height_m || 60)) * 200)}
+                fill="var(--drone-selection-fill)"
+                stroke="var(--warning)"
                 strokeDasharray="3 5"
                 strokeWidth=".7"
               />
               <path
                 d="M0 -8 6 5 0 2 -6 5Z"
                 fill="none"
-                stroke="#d5ad72"
+                stroke="var(--warning)"
                 strokeDasharray="2 2"
                 strokeWidth="1.2"
               />
@@ -3412,7 +3479,7 @@ function EdgeMap({ device }: { device: Device }) {
           0 / 0
         </text>
         <text x="545" y="225" fontSize="8" fill="var(--muted)">
-          80 / 60 m
+          {device.workspace?.width_m || 80} / {device.workspace?.height_m || 60} м
         </text>
         {!p && (
           <text
@@ -3570,7 +3637,7 @@ function ResearchResult({ result }: { result: Record<string, unknown> }) {
           <Chart
             data={chart}
             keys={histories.map((_, i) => "s" + i)}
-            colors={["#3bd8d0", "#7187ff", "#d3a96e", "#a58ed1"]}
+            colors={["var(--accent)", "var(--secondary)", "var(--plot-tertiary)", "var(--plot-quaternary)"]}
             height={150}
           />
           <div className="fleet-table">

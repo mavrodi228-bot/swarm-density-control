@@ -35,11 +35,40 @@ def load_settings() -> None:
 
 def ready(url: str) -> bool:
     try:
-        with urllib.request.urlopen(url + "/api/health", timeout=2) as response:
+        # A machine-wide HTTP proxy must never intercept a loopback health check.
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(url + "/api/health", timeout=2) as response:
             payload = json.load(response)
             return response.status == 200 and (payload.get("app") == "AGMEN" or payload.get("service", "").lower().startswith("agmen"))
     except (urllib.error.URLError, OSError, ValueError):
         return False
+
+
+def start_background(command: list[str], output):
+    """Detach from both the terminal and a calling IDE's Windows job object.
+
+    CREATE_NO_WINDOW only hides a child; a job-owning terminal can still kill it
+    when its command completes. BREAKAWAY makes the server independent, while
+    DETACHED_PROCESS keeps Windows from allocating a visible console.
+    """
+    options: dict = {"cwd": str(ROOT), "stdout": output,
+                     "stderr": subprocess.STDOUT, "stdin": subprocess.DEVNULL}
+    if os.name == "nt":
+        options["creationflags"] = (subprocess.DETACHED_PROCESS
+                                     | subprocess.CREATE_NEW_PROCESS_GROUP
+                                     | subprocess.CREATE_BREAKAWAY_FROM_JOB)
+    else:
+        options["start_new_session"] = True
+    try:
+        return subprocess.Popen(command, **options)
+    except OSError as error:
+        if os.name == "nt" and getattr(error, "winerror", None) == 5:
+            raise RuntimeError(
+                "This terminal does not allow an independent background server. "
+                "Double-click RUN_AGMEN.cmd in Explorer, or run "
+                "RUN_AGMEN.cmd --foreground and keep that terminal open."
+            ) from error
+        raise
 
 
 def prepare_runtime() -> Path:
@@ -92,13 +121,10 @@ def main() -> int:
         logs = ROOT / "logs"
         logs.mkdir(exist_ok=True)
         with (logs / "agmen-server.log").open("ab") as output:
-            options: dict = {"cwd": str(ROOT), "stdout": output, "stderr": subprocess.STDOUT, "stdin": subprocess.DEVNULL}
-            if os.name == "nt":
-                options["creationflags"] = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
-            else:
-                options["start_new_session"] = True
-            process = subprocess.Popen(command, **options)
-        (logs / "server.json").write_text(json.dumps({"pid": process.pid, "url": url}), encoding="utf-8")
+            process = start_background(command, output)
+        (logs / "server.json").write_text(json.dumps({"pid": process.pid, "url": url,
+                                                     "started_at": time.time(),
+                                                     "mode": "detached"}), encoding="utf-8")
         deadline = time.monotonic() + 90
         while time.monotonic() < deadline:
             if ready(url):

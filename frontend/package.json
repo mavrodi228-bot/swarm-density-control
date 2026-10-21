@@ -8,7 +8,10 @@
     "build": "tsc -b && vite build",
     "preview": "vite preview --host 127.0.0.1",
     "test:smoke": "node ../scripts/smoke_browser.cjs",
-    "test:research": "node scripts/qa-research.mjs"
+    "test:research": "node scripts/qa-research.mjs",
+    "test:connection": "node scripts/qa-connection.mjs",
+    "test:themes": "node scripts/qa-themes.mjs",
+    "test:territory": "node scripts/qa-territory.mjs"
   },
   "dependencies": {
     "lucide-react": "^0.468.0",

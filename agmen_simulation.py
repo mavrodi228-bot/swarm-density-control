@@ -1,7 +1,8 @@
 """Deterministic planar simulation built from the repository's fleet controller.
 
 No aircraft, GPS, radios, or batteries are connected. Coordinates are normalized
-for rendering; integration and safety calculations use metres in an 80 x 60 m area.
+for rendering; integration and safety use metres in a calibrated local plane,
+defaulting to 80 x 60 m. Image axes are x right, y down, without geographic origin.
 """
 from __future__ import annotations
 
@@ -14,9 +15,10 @@ import numpy as np
 from fleet_core import (
     FleetSimConfig, TargetPoint, assign_drones_to_slots, build_target_slots,
     density_control_commands, initial_positions, obstacle_mask, obstacle_rectangles,
-    positions_to_density, target_density_from_points, _prevent_rect_crossing,
+    positions_to_density, target_density_from_points, _prevent_rect_crossing, _segment_intersects_rect,
 )
 from swarm_core import expert_flux
+from territory import restricted_mask, mask_rectangles, free_slots, initial_free_positions
 
 WIDTH, HEIGHT, DT, GRID = 80.0, 60.0, 0.2, 24
 CONTROLLERS = {"baseline": "Математический эталон", "neural": "Нейросеть", "hybrid": "Гибрид 70/30"}
@@ -42,14 +44,14 @@ def _zones(config: dict, step: int) -> list[dict]:
     return [{"x": .78, "y": .50, "radius": .18, "weight": 1.0}]
 
 
-def _targets(zones: list[dict], count: int) -> list[TargetPoint]:
+def _targets(zones: list[dict], count: int, width=WIDTH, height=HEIGHT) -> list[TargetPoint]:
     weights = np.asarray([z.get("weight", 1) for z in zones], float)
     raw = weights / weights.sum() * count
     counts = np.floor(raw).astype(int)
     for i in np.argsort(-(raw - counts))[:count - int(counts.sum())]:
         counts[i] += 1
-    return [TargetPoint(f"T{i+1}", z["x"] * WIDTH, z["y"] * HEIGHT,
-                        int(n), z.get("radius", .12) * min(WIDTH, HEIGHT))
+    return [TargetPoint(f"T{i+1}", z["x"] * width, z["y"] * height,
+                        int(n), z.get("radius", .12) * min(width, height))
             for i, (z, n) in enumerate(zip(zones, counts)) if n > 0]
 
 
@@ -73,19 +75,32 @@ def simulate(config: dict, model=None, device="cpu", events: list[dict] | None =
     the physical prefix (timings may vary). Failures and lost links hold the affected
     virtual vehicle; the remaining vehicles receive newly allocated target slots.
     """
+    width, height = config.get("width_m", WIDTH), config.get("height_m", HEIGHT)
     cfg = FleetSimConfig(drone_count=config["drone_count"], planar_steps=config["steps"],
+                         workspace_width_m=width, workspace_height_m=height,
                          grid_size=GRID, dt=DT, max_speed_mps=config["max_speed"],
                          min_separation_m=config["safe_distance"], seed=config["seed"],
                          controller=CONTROLLERS[config["controller"]],
                          obstacle_preset=OBSTACLES[config["obstacle"]], slot_gain=slot_gain)
     if config["controller"] != "baseline" and model is None:
         raise ValueError("Trained neural checkpoint is unavailable; select the mathematical baseline.")
-    rects = obstacle_rectangles(cfg.obstacle_preset, WIDTH, HEIGHT)
+    rects = obstacle_rectangles(cfg.obstacle_preset, width, height)
     obstacle = obstacle_mask(GRID, cfg.obstacle_preset)
-    pos = initial_positions(cfg.drone_count, WIDTH, HEIGHT, "Сетка слева", rects,
-                            cfg.seed, min_sep=min(.8, config["safe_distance"] * .5))
+    restrictions = config.get("restricted_zones") or []
+    if restrictions:
+        custom_mask = restricted_mask(restrictions, GRID, width, height)
+        obstacle = obstacle | custom_mask
+        rects += mask_rectangles(custom_mask, width, height)
+        if obstacle.all():
+            raise ValueError("Restrictions leave no free territory cells")
+        pos = initial_free_positions(cfg.drone_count, rects, width, height, cfg.seed)
+    else:
+        pos = initial_positions(cfg.drone_count, width, height, "Сетка слева", rects,
+                                cfg.seed, min_sep=min(.8, config["safe_distance"] * .5))
     if config["scenario"] == "return":
-        pos[:, 0] = WIDTH - pos[:, 0]
+        pos[:, 0] = width - pos[:, 0]
+        if restrictions:
+            pos, _ = free_slots(pos, rects, width, height)
     vel = np.zeros_like(pos)
     battery = np.full(cfg.drone_count, 100.0)
     statuses = np.full(cfg.drone_count, "active", dtype=object)
@@ -94,6 +109,8 @@ def simulate(config: dict, model=None, device="cpu", events: list[dict] | None =
     override = None
     old_zone_key = None
     assigned = None
+    initial_assigned = None
+    relocated_slots = 0
     frames, history = [], []
     started = time.perf_counter()
     target = np.zeros((GRID, GRID))
@@ -118,33 +135,44 @@ def simulate(config: dict, model=None, device="cpu", events: list[dict] | None =
         zones = override or _zones(config, zone_step)
         zone_key = str(zones)
         if zone_key != old_zone_key or changed:
-            target_points = _targets(zones, max(1, len(active)))
-            target = target_density_from_points(GRID, target_points, WIDTH, HEIGHT, obstacle)
+            target_points = _targets(zones, max(1, len(active)), width, height)
+            target = target_density_from_points(GRID, target_points, width, height, obstacle)
             if len(active):
-                slots, _ = build_target_slots(target_points, WIDTH, HEIGHT, rects)
+                slots, _ = build_target_slots(target_points, width, height, rects)
+                if restrictions:
+                    slots, moved = free_slots(slots, rects, width, height)
+                    relocated_slots += moved
                 assigned = slots[assign_drones_to_slots(pos[active], slots)]
+                if initial_assigned is None:
+                    initial_assigned = assigned.copy()
             old_zone_key = zone_key
         compute_ms = 0.0
-        rho = positions_to_density(pos, GRID, WIDTH, HEIGHT, obstacle)
+        rho = positions_to_density(pos, GRID, width, height, obstacle)
         flux = expert_flux(rho, target, obstacle)
         if step and len(active):
             cmd, _, flux, _, _, compute_ms = density_control_commands(
                 pos[active], vel[active], assigned, target, obstacle, rects, cfg, model, device)
-            new = _prevent_rect_crossing(pos[active], pos[active] + cmd * DT, rects, WIDTH, HEIGHT)
+            new = _prevent_rect_crossing(pos[active], pos[active] + cmd * DT, rects, width, height)
+            # Core integration checks endpoints. Confirmed restrictions additionally
+            # reject an entire swept segment, including thin crossed obstacles.
+            if restrictions:
+                for index, before in enumerate(pos[active]):
+                    if any(_segment_intersects_rect(before, new[index], rectangle, .15) for rectangle in rects):
+                        new[index] = before
             vel[active] = (new - pos[active]) / DT
             pos[active] = new
         speed = np.linalg.norm(vel, axis=1)
         if step:
             battery -= DT * (.012 + .003 * speed * speed) * (statuses != "failed")
         battery = np.clip(battery, 0, 100)
-        rho = positions_to_density(pos, GRID, WIDTH, HEIGHT, obstacle)
+        rho = positions_to_density(pos, GRID, width, height, obstacle)
         minimum, violations = _safety(pos, cfg.min_separation_m)
         metrics = {"mae": float(np.abs(rho - target).mean()),
                    "tv_distance": float(.5 * np.abs(rho - target).sum()),
                    "compute_ms": compute_ms, "min_distance": minimum, "violations": violations}
         history.append({"step": step, "time": round(step * DT, 4), **metrics, "mean_speed": float(speed.mean())})
         if include_frames:
-            agents = [{"id": i + 1, "x": float(pos[i, 0] / WIDTH), "y": float(pos[i, 1] / HEIGHT),
+            agents = [{"id": i + 1, "x": float(pos[i, 0] / width), "y": float(pos[i, 1] / height),
                        "heading": float(math.atan2(vel[i, 1], vel[i, 0])), "speed": float(speed[i]),
                        "battery": float(battery[i]), "link": links[i], "status": statuses[i],
                        "altitude": 0.0 if statuses[i] == "failed" else 20.0}
@@ -169,8 +197,13 @@ def simulate(config: dict, model=None, device="cpu", events: list[dict] | None =
                "battery_model": "100% minus dt*(0.012+0.003*speed^2); illustrative only",
                "safety_note": "Violations are measured point-pair samples in the planar model; no collision guarantee."}
     return {"frames": frames, "target": _array(target), "obstacle": obstacle.tolist(),
-            "obstacle_rects": [{"x": x0/WIDTH, "y": y0/HEIGHT, "width": (x1-x0)/WIDTH, "height": (y1-y0)/HEIGHT}
+            "obstacle_rects": [{"x": x0/width, "y": y0/height, "width": (x1-x0)/width, "height": (y1-y0)/height}
                                for x0, y0, x1, y1 in rects],
             "history": history, "events": events, "summary": summary,
-            "workspace": {"width_m": WIDTH, "height_m": HEIGHT, "dt": DT, "grid_size": GRID},
+            "workspace": {"width_m": width, "height_m": height, "dt": DT, "grid_size": GRID},
+            "territory": config.get("map_snapshot"), "restricted_zones": restrictions,
+            "restriction_policy": {"method": "conservative_grid_cell_cover", "grid_size": GRID,
+                                   "target_slots_projected_to_free_cells": relocated_slots,
+                                   "swept_segment_checks": bool(restrictions)},
+            "initial_assigned_slots_m": _array(initial_assigned) if initial_assigned is not None else [],
             "simulation_only": True}

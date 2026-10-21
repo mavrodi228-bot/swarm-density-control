@@ -85,15 +85,36 @@ def _replace_file(source, target):
             time.sleep(0.01 * (attempt + 1))
 
 
+def _read_json(path: Path):
+    # Atomic replacement prevents partial JSON, but Windows may also deny an
+    # open while the worker replaces the file. Retry only that sharing lock;
+    # missing files and malformed JSON must retain their distinct meanings.
+    for attempt in range(20):
+        try:
+            text = path.read_text(encoding="utf-8")
+            break
+        except PermissionError:
+            if attempt == 19:
+                raise
+            time.sleep(0.01 * (attempt + 1))
+    return json.loads(text)
+
+
 def _read_run(run_id: str):
     path = _run_dir(run_id) / "run.json"
     try:
-        run = json.loads(path.read_text(encoding="utf-8"))
-        if run.get("status") in ACTIVE_STATUSES and (path.parent / "stop.request").exists():
-            run["status"] = "stopping"
-        return run
-    except (FileNotFoundError, ValueError):
+        run = _read_json(path)
+    except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Training run not found") from None
+    except PermissionError as error:
+        raise HTTPException(status_code=503, detail="Training state is temporarily locked. Retry shortly.") from error
+    except (ValueError, UnicodeError) as error:
+        raise HTTPException(status_code=500, detail="Training run state is corrupt; the saved file was preserved.") from error
+    if not isinstance(run, dict) or run.get("id") != run_id or not isinstance(run.get("status"), str) or run["status"] not in ACTIVE_STATUSES | {"completed", "stopped", "failed"}:
+        raise HTTPException(status_code=500, detail="Training run state is invalid; the saved file was preserved.")
+    if run["status"] in ACTIVE_STATUSES and (path.parent / "stop.request").exists():
+        run["status"] = "stopping"
+    return run
 
 
 def _log(run, message):
@@ -240,8 +261,9 @@ def _recover_worker():
         try:
             if _read_run(run_id)["status"] not in ACTIVE_STATUSES:
                 _release_slot(run_id)
-        except HTTPException:
-            pass
+        except HTTPException as error:
+            if error.status_code != 404:
+                raise
         return
     if RUN_ID.fullmatch(run_id):
         try:
@@ -251,8 +273,9 @@ def _recover_worker():
                 run["error"] = "Worker exited unexpectedly. Resume the saved checkpoint." if run["status"] == "stopped" else "Worker exited before saving a checkpoint."
                 _log(run, run["error"])
                 _save_run(run)
-        except HTTPException:
-            pass
+        except HTTPException as error:
+            if error.status_code != 404:
+                raise
     path.unlink(missing_ok=True)
 
 
@@ -351,8 +374,9 @@ def list_runs():
                 if item.is_dir() and RUN_ID.fullmatch(item.name):
                     try:
                         runs.append(_read_run(item.name))
-                    except HTTPException:
-                        continue
+                    except HTTPException as error:
+                        if error.status_code != 404:
+                            raise
         return sorted(runs, key=lambda run: run["created_at"], reverse=True)
 
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import json
 from pathlib import Path
 import tempfile
 import time
@@ -68,6 +69,37 @@ class LabTests(unittest.TestCase):
         self.assertFalse(bundled["validated"])
         self.assertFalse(bundled["hardware_promoted"])
         self.assertNotIn("path", bundled)
+
+    def test_run_read_retries_sharing_lock_without_replacing_saved_state(self):
+        run_id = "a" * 32
+        path = ml_lab._run_dir(run_id) / "run.json"
+        state = {"id": run_id, "status": "running", "created_at": "2026-10-21", "history": [{"epoch": 1}]}
+        ml_lab._atomic_json(path, state)
+        saved = path.read_bytes()
+        with patch.object(Path, "read_text", side_effect=[PermissionError(13, "sharing lock"), PermissionError(13, "sharing lock"), saved.decode("utf-8")]) as read, patch.object(ml_lab.time, "sleep") as sleep:
+            self.assertEqual(ml_lab._read_run(run_id), state)
+        self.assertEqual(read.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+        self.assertEqual(path.read_bytes(), saved)
+        with patch.object(Path, "read_text", side_effect=PermissionError(13, "persistent lock")) as read, patch.object(ml_lab.time, "sleep"):
+            with self.assertRaises(ml_lab.HTTPException) as result:
+                ml_lab._read_run(run_id)
+        self.assertEqual(result.exception.status_code, 503)
+        self.assertEqual(read.call_count, 20)
+        self.assertEqual(path.read_bytes(), saved)
+
+    def test_corrupt_or_invalid_run_is_reported_and_never_silently_dropped(self):
+        run_id = "b" * 32
+        path = ml_lab._run_dir(run_id) / "run.json"
+        path.parent.mkdir(parents=True)
+        for content in ('{"id":', json.dumps([]), json.dumps({"id": "c" * 32, "status": "running"}), json.dumps({"id": run_id, "status": []})):
+            path.write_text(content, encoding="utf-8")
+            with patch.object(ml_lab.time, "sleep") as sleep:
+                response = self.client.get(f"/api/lab/runs/{run_id}")
+                self.assertEqual(response.status_code, 500, response.text)
+                self.assertEqual(self.client.get("/api/lab/runs").status_code, 500)
+            sleep.assert_not_called()
+            self.assertEqual(path.read_text(encoding="utf-8"), content)
 
     def _wait_for(self, run_id, target, timeout=180):
         deadline = time.monotonic() + timeout

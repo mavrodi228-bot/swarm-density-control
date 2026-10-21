@@ -22,7 +22,7 @@ import numpy as np
 from fleet_core import (
     FleetSimConfig, bilinear_sample, slot_guidance_velocity,
     obstacle_boundary_velocity, positions_to_density, separation_velocity,
-    _clip_vectors, _prevent_rect_crossing,
+    _clip_vectors, _prevent_rect_crossing, _segment_intersects_rect,
 )
 from swarm_core import expert_flux
 from .package import load_package, _validate_content, _json_bytes, PackageError
@@ -321,6 +321,11 @@ class EdgeRuntime:
                         desired = _clip_vectors(desired, self.cfg.max_speed_mps)
                 proposed = before[None] + desired * self.dt
                 moved = _prevent_rect_crossing(before[None], proposed, self.rectangles, self.width, self.height)[0]
+                # Confirmed territory restrictions cover whole swept segments,
+                # including steps whose endpoints both lie outside an obstacle.
+                if self.map.get("restricted_zones") and any(
+                        _segment_intersects_rect(before, moved, rectangle, .15) for rectangle in self.rectangles):
+                    moved = before.copy()
                 if not np.allclose(moved, proposed[0], atol=1e-10):
                     self.state["emergency_stops"] += 1
                 actual_velocity = (moved - before) / self.dt
@@ -367,6 +372,7 @@ class EdgeRuntime:
         with self.lock:
             state = copy.deepcopy(self.state)
             state["id"] = self.package_id
+            state["workspace"] = copy.deepcopy(self.map["workspace"])
             state["x"], state["y"] = state["position_m"][0] / self.width, state["position_m"][1] / self.height
             state["mode"] = self._mode()
             state["metrics"] = self._metrics()

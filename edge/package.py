@@ -81,7 +81,7 @@ def _validate_content(package):
             raise PackageError(f"Invalid normalized {name}")
     width, height = workspace["width_m"], workspace["height_m"]
     rectangles = local_map.get("obstacle_rectangles_m")
-    if not isinstance(rectangles, list) or len(rectangles) > 64:
+    if not isinstance(rectangles, list) or len(rectangles) > 256:
         raise PackageError("Invalid obstacle boundaries")
     for rectangle in rectangles:
         x0, y0, x1, y1 = _vector(rectangle, 4, "obstacle rectangle")
@@ -153,17 +153,23 @@ def build_package(mission: dict, drone_id: int, policy="continue", coordination=
         raise PackageError("The selected drone is absent from the mission")
     workspace = dict(mission.get("workspace", {"width_m": 80., "height_m": 60., "dt": .2, "grid_size": 24}))
     width, height = workspace["width_m"], workspace["height_m"]
-    if (width, height) != (80., 60.):
-        raise PackageError("Recorded mission must use the original 80 x 60 m plane")
-    rectangles = [[rect["x"] * width, rect["y"] * height, (rect["x"] + rect["width"]) * width, (rect["y"] + rect["height"]) * height] for rect in mission.get("obstacle_rects", [])]
+    rectangles = [[max(0., rect["x"] * width), max(0., rect["y"] * height),
+                   min(width, (rect["x"] + rect["width"]) * width),
+                   min(height, (rect["y"] + rect["height"]) * height)]
+                  for rect in mission.get("obstacle_rects", [])]
     positions = np.asarray([[agent["x"] * width, agent["y"] * height] for agent in agents])
     zones = _zones(config, 0)
     for event in mission.get("events", []):
         if event.get("step") == 0 and event.get("kind") == "target_change":
             zones = event.get("targets") or [{"x": .22, "y": .77, "radius": .16, "weight": 1.0}]
-    slots, labels = build_target_slots(_targets(zones, len(agents)), width, height, rectangles)
+    slots, labels = build_target_slots(_targets(zones, len(agents), width, height), width, height, rectangles)
+    if config.get("restricted_zones"):
+        from territory import free_slots
+        slots, _ = free_slots(slots, rectangles, width, height, workspace["grid_size"])
     assignment = assign_drones_to_slots(positions, slots)
     selected_slot = slots[assignment[drone_id - 1]]
+    if mission.get("initial_assigned_slots_m"):
+        selected_slot = np.asarray(mission["initial_assigned_slots_m"][drone_id - 1], dtype=float)
     obstacle = np.asarray(mission["obstacle"], dtype=bool)
     initial = np.asarray(frame["density"], dtype=float)
     target = np.asarray(frame["target"], dtype=float)
@@ -203,7 +209,10 @@ def build_package(mission: dict, drone_id: int, policy="continue", coordination=
             "logging": {"max_entries": 2048, "max_history": 1024}, "simulation_only": True,
         },
         "map": {"coordinate_system": "local_planar_metres", "geographic_origin": None, "workspace": workspace,
-                "obstacle": obstacle.tolist(), "obstacle_rectangles_m": rectangles},
+                "obstacle": obstacle.tolist(), "obstacle_rectangles_m": rectangles,
+                "map_id": config.get("map_id"), "territory": mission.get("territory"),
+                "restricted_zones": config.get("restricted_zones", []),
+                "restriction_policy": mission.get("restriction_policy")},
         "fields": {"initial_density": initial.tolist(), "target_density": target.tolist(), "flux_x": jx.tolist(), "flux_y": jy.tolist()},
     }
     package["mission"]["controller_parameters"]["min_separation_m"] = config["safe_distance"]
