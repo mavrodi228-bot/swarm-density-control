@@ -11,7 +11,9 @@
     "test:research": "node scripts/qa-research.mjs",
     "test:connection": "node scripts/qa-connection.mjs",
     "test:themes": "node scripts/qa-themes.mjs",
-    "test:territory": "node scripts/qa-territory.mjs"
+    "test:territory": "node scripts/qa-territory.mjs",
+    "test:arrival": "node scripts/qa-arrival-stage.mjs",
+    "test:territory-hooks": "node scripts/qa-territory-hooks.mjs"
   },
   "dependencies": {
     "lucide-react": "^0.468.0",

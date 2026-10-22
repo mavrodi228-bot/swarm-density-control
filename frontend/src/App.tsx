@@ -3,6 +3,8 @@ import type { ReactElement, ReactNode } from "react";
 import { api, download, CONNECTION_EVENT, ApiError } from "./api";
 import { useTerritory, TerritoryPanel, TerritoryBackground, TerritoryLayers } from "./TerritoryMap";
 import type { RestrictedZone } from "./TerritoryMap";
+import { ArrivalStage } from "./ArrivalStage";
+import type { Arrival, StageMission } from "./ArrivalStage";
 import {
   Activity,
   ArrowDownToLine,
@@ -48,6 +50,10 @@ type Agent = {
   battery: number;
   link: string;
   status: string;
+  arrived?: boolean;
+  source_drone_id?: number;
+  target_zone_index?: number | null;
+  distance_to_target_m?: number | null;
 };
 type Metrics = {
   mae: number;
@@ -65,6 +71,7 @@ type Frame = {
   target?: number[][];
   flux_x?: number[][];
   flux_y?: number[][];
+  arrival?: Arrival;
 };
 type Config = {
   name: string;
@@ -82,6 +89,7 @@ type Config = {
   restricted_zones?: RestrictedZone[];
   width_m?: number;
   height_m?: number;
+  wait_for_arrival?: boolean;
 };
 type Zone = { x: number; y: number; radius: number; weight: number };
 type Mission = {
@@ -94,8 +102,11 @@ type Mission = {
   obstacle_rects?: { x: number; y: number; width: number; height: number }[];
   history?: Record<string, number>[];
   events?: Record<string, unknown>[];
-  summary?: Record<string, number | boolean>;
+  summary?: Record<string, number | boolean | string | null>;
   workspace?: { width_m: number; height_m: number };
+  arrival?: Arrival;
+  progress?: Arrival & { actual_steps: number; time_s?: number; arrival?: Arrival };
+  stage?: StageMission["stage"];
   error?: string;
 };
 type Bootstrap = {
@@ -168,6 +179,7 @@ const defaults: Config = {
   max_speed: 3,
   safe_distance: 1.2,
   obstacle: "central",
+  wait_for_arrival: true,
 };
 const labels: Record<string, string> = {
   baseline: "Математический",
@@ -191,6 +203,11 @@ const labels: Record<string, string> = {
 };
 const fmt = (n: unknown, d = 2) =>
   typeof n === "number" && Number.isFinite(n) ? n.toFixed(d) : "—";
+const arrivalReasons: Record<string, string> = {
+  stalled: "Часть аппаратов не может приблизиться к целям. Проверьте препятствия, размеры зон и дистанцию между аппаратами.",
+  step_limit: "Не все аппараты успели прибыть. Можно продолжить расчёт из текущих позиций.",
+  vehicle_unavailable: "В группе есть аппарат с отказом или без связи. Прибытие всей группы не подтверждено.",
+};
 function IconButton({
   title,
   onClick,
@@ -351,7 +368,15 @@ function App() {
   const hasTerrainDraft = useRef(localStorage.getItem("agmen-territory") !== null);
   const territory = useTerritory(setError, online, (reason) => {
     setMission(null); setPlaying(false); setFrameIndex(0);
-    if (reason === "map") { setConfig(current => ({ ...current, obstacle: "none" })); setZones([]); }
+    missionRef.current = null;
+    missionSelection.current += 1;
+    localStorage.removeItem("agmen-mission");
+    hasTerrainDraft.current = true;
+    setSelected([]); setDrawing(null); drag.current = null;
+    if (reason === "map" || reason === "reset") {
+      setConfig(current => ({ ...current, obstacle: "none" })); setZones([]);
+      setTool("select"); setMapZoom(1);
+    }
   });
   const [reconnecting, setReconnecting] = useState(true);
   const [connectionIssue, setConnectionIssue] = useState("");
@@ -373,7 +398,9 @@ function App() {
   const [toast, setToast] = useState("");
   const reconnect = useRef<() => void>(() => {});
   const missionRef = useRef(mission);
+  const missionSelection = useRef(0);
   missionRef.current = mission;
+  const missionEpoch = missionSelection.current;
   const mapRef = useRef<SVGSVGElement | null>(null);
   const drag = useRef<{ x: number; y: number } | null>(null);
   const [drawing, setDrawing] = useState<Zone | null>(null);
@@ -415,6 +442,7 @@ function App() {
   const metrics = frame?.metrics;
   const calculating =
     mission?.status === "running" || mission?.status === "queued";
+  const currentArrival = calculating ? mission.progress?.arrival || mission.progress : frame?.arrival;
   const device =
     edge.devices.find((d) => d.id === edgeDevice) || edge.devices[0];
   const profile = typeof boot?.profile === "object" ? boot.profile : undefined;
@@ -450,6 +478,7 @@ function App() {
           setBoot(b);
           setMissions(b.missions || []);
           const current = missionRef.current;
+          const selection = missionSelection.current;
           const saved = current?.id || localStorage.getItem("agmen-mission");
           const initial = b.missions?.find((m) => m.id === saved) || (!initialized ? b.missions?.[0] : undefined);
           if (initial) {
@@ -461,9 +490,9 @@ function App() {
                 JSON.stringify(m.config?.restricted_zones || [], ["kind", "x", "y", "width", "height", "radius", "points"]) &&
               (!m.workspace || (territory.width === m.workspace.width_m && territory.height === m.workspace.height_m))
             );
-            if (initialized || current || sameTerritory) setMission(m);
+            if (selection === missionSelection.current && (initialized || current || sameTerritory)) { missionRef.current = m; setMission(m); }
             // Reconnection updates results while preserving edits in the mission form.
-            if (!initialized && !current && sameTerritory && m.config) {
+            if (selection === missionSelection.current && !initialized && !current && sameTerritory && m.config) {
               setConfig(m.config);
               setZones(m.config.targets || []);
               if (!hasTerrainDraft.current) territory.restore(m.config.map_id, m.config.restricted_zones, m.workspace);
@@ -517,23 +546,36 @@ function App() {
   }, []);
   useEffect(() => {
     if (!mission?.id || !calculating || !online) return;
+    let live = true;
+    let pending = false;
     const t = setInterval(async () => {
+      if (pending) return;
+      pending = true;
+      const selection = missionSelection.current;
       try {
         const m = await api<Mission>(`/api/missions/${mission.id}`);
+        if (!live || selection !== missionSelection.current || missionRef.current?.id !== m.id) return;
+        missionRef.current = m;
         setMission(m);
         if (m.status === "completed") {
           if (m.config) territory.restore(m.config.map_id, m.config.restricted_zones, m.workspace);
           setFrameIndex(0);
           setPlaying(true);
           setMissions((prev) => [m, ...prev.filter((x) => x.id !== m.id)]);
-          setToast("Расчёт завершён. Воспроизведение рассчитанной траектории.");
+          setToast(m.arrival?.all_arrived
+            ? `Все ${m.arrival.total_count} аппаратов прибыли. Траектория готова к просмотру.`
+            : m.summary?.completion_status === "incomplete"
+              ? "Расчёт сохранён. Не все аппараты достигли целей — проверьте статус прибытия."
+              : "Расчёт завершён. Воспроизведение рассчитанной траектории.");
         }
         if (m.status === "failed") setError(m.error || "Ошибка расчёта миссии");
       } catch (e) {
-        setError((e as Error).message);
+        if (live && selection === missionSelection.current) setError((e as Error).message);
+      } finally {
+        pending = false;
       }
     }, 900);
-    return () => clearInterval(t);
+    return () => { live = false; clearInterval(t); };
   }, [mission?.id, calculating, online]);
   useEffect(() => {
     if (!playing || frames.length < 2) return;
@@ -654,6 +696,7 @@ function App() {
       .catch(() => {});
   }, [page, pro, online]);
   async function createMission() {
+    const selection = ++missionSelection.current;
     setError("");
     setBusy(true);
     setPlaying(false);
@@ -668,6 +711,7 @@ function App() {
         seed: config.seed,
         max_speed: config.max_speed,
         safe_distance: config.safe_distance,
+        wait_for_arrival: config.wait_for_arrival !== false,
         obstacle: config.obstacle,
         targets: zones.length ? zones : undefined,
         map_id: territory.mapId,
@@ -675,6 +719,8 @@ function App() {
         width_m: territory.width,
         height_m: territory.height,
       });
+      if (selection !== missionSelection.current) return;
+      missionRef.current = m;
       setMission(m);
       if (m.config) territory.restore(m.config.map_id, m.config.restricted_zones, m.workspace || {
         width_m: m.config.width_m || 80, height_m: m.config.height_m || 60,
@@ -694,8 +740,11 @@ function App() {
     }
   }
   async function loadMission(id: string) {
+    const selection = ++missionSelection.current;
     try {
       const m = await api<Mission>(`/api/missions/${id}`);
+      if (selection !== missionSelection.current) return;
+      missionRef.current = m;
       setMission(m);
       setFrameIndex(0);
       setPlaying(false);
@@ -709,6 +758,23 @@ function App() {
       setError((e as Error).message);
     }
   }
+  function adoptStage(created: StageMission, parentId: string, selection: number) {
+    if (missionRef.current?.id !== parentId || missionSelection.current !== selection) return;
+    missionSelection.current += 1;
+    const next = created as Mission;
+    missionRef.current = next;
+    setMission(next); setPlaying(false); setFrameIndex(0); setSelected([]);
+    if (next.config) {
+      setConfig(next.config); setZones(next.config.targets || []);
+      territory.restore(next.config.map_id, next.config.restricted_zones, next.workspace || {
+        width_m: next.config.width_m || 80, height_m: next.config.height_m || 60,
+      });
+    }
+    setMissions(previous => [next, ...previous.filter(value => value.id !== next.id)]);
+    localStorage.setItem("agmen-mission", next.id);
+    setToast("Продолжение начато из сохранённых позиций группы.");
+    requestAnimationFrame(() => mapRef.current?.closest(".map-panel")?.scrollIntoView({ behavior: "smooth", block: "start" }));
+  }
   async function failDrone(kind: string) {
     if (!mission || !selected.length) return;
     try {
@@ -718,7 +784,7 @@ function App() {
         drone_id: selected[0],
         step: Math.max(
           1,
-          Math.min(frame?.step || 1, (mission.config?.steps || 120) - 1),
+          Math.min(frame?.step || 1, Number(mission.summary?.actual_steps || mission.config?.steps || 120) - 1),
         ),
       });
       setMission(m);
@@ -997,6 +1063,13 @@ function App() {
                   tone="green"
                 />
               </section>
+              {mission?.stage?.parent_mission_id && <div className="mission-lineage"><Waypoints size={16} /><span>Этап {mission.stage.index || 2} · продолжение миссии</span><button className="text-button" onClick={() => loadMission(mission.stage!.parent_mission_id!)}>Открыть предыдущий этап <ArrowRight size={14} /></button></div>}
+              {(currentArrival || calculating || mission?.arrival) && <div className={`arrival-progress ${mission?.summary?.completion_status === "incomplete" ? "incomplete" : ""}`} role="status" aria-label="Прибытие аппаратов">
+                <div><strong>{calculating ? mission.config?.wait_for_arrival !== false ? "Продолжаем расчёт до прибытия группы" : "Расчёт заданного участка траектории" : currentArrival?.all_arrived ? "Вся группа в конечных зонах" : "Прибытие в конечные зоны"}</strong><span>{currentArrival ? `${currentArrival.arrived_count} из ${currentArrival.total_count} аппаратов` : "Считаем траектории…"}{calculating && mission?.progress?.actual_steps ? ` · шаг ${mission.progress.actual_steps}` : ""}</span></div>
+                <progress aria-label="Количество прибывших аппаратов" max={currentArrival?.total_count || config.drone_count} value={currentArrival?.arrived_count || 0} />
+                {mission?.summary?.completion_status === "incomplete" && <p>{arrivalReasons[String(mission.summary.termination_reason)] || "Прибытие всей группы не подтверждено."}</p>}
+                {!!mission?.summary?.duration_s && <small>Время движения: {fmt(mission.summary.duration_s, 1)} с · минимально задано {(mission.config?.steps || config.steps) * .2} с</small>}
+              </div>}
               <div className="mission-layout">
                 <section className="panel map-panel">
                   <div className="panel-header">
@@ -1017,7 +1090,7 @@ function App() {
                           : playing
                             ? "Воспроизведение"
                             : frames.length
-                              ? "Расчёт завершён"
+                              ? mission?.summary?.completion_status === "incomplete" ? "Не все прибыли" : mission?.arrival?.all_arrived ? "Прибытие подтверждено" : "Расчёт завершён"
                               : "Готов к запуску"}
                       </span>
                       <IconButton
@@ -1035,7 +1108,7 @@ function App() {
                       </IconButton>
                     </div>
                   </div>
-                  <TerritoryPanel editor={territory} disabled={calculating || !online} onActivate={() => setTool("select")} />
+                  <TerritoryPanel editor={{ ...territory, clearZones: () => { territory.clearZones(); setZones([]); setTool("select"); } }} additionalZoneCount={zones.length} disabled={calculating || !online} onActivate={() => setTool("select")} />
                   <div
                     className={`map-viewport ${tool === "target" || territory.tool !== "select" ? "draw-mode" : ""}`}
                   >
@@ -1301,6 +1374,7 @@ function App() {
                               strokeWidth="1.2"
                             />
                             <text
+                              className="map-zone-label"
                               x={44 + z.x * 880}
                               y={28 + z.y * 578}
                               textAnchor="middle"
@@ -1748,11 +1822,12 @@ function App() {
                           .filter((s) => s <= maxSteps)
                           .map((s) => (
                             <option value={s} key={s}>
-                              {s} шагов симуляции
+                              {s} шагов · {s * .2} с{config.wait_for_arrival !== false ? " минимум" : ""}
                             </option>
                           ))}
                       </select>
                     </Field>
+                    <label className="wait-arrival-option"><input type="checkbox" aria-label="Дожидаться всех аппаратов" checked={config.wait_for_arrival !== false} onChange={event => setConfig(current => ({ ...current, wait_for_arrival: event.target.checked }))} /><span><strong>Дожидаться всех аппаратов</strong><small>Продолжать после заданного времени, пока вся группа не достигнет назначенных зон.</small></span></label>
                     {pro && (
                       <div className="advanced">
                         <span className="eyebrow">РАСШИРЕННЫЕ ПАРАМЕТРЫ</span>
@@ -1824,6 +1899,7 @@ function App() {
                   </div>
                 </aside>
               </div>
+              {mission && <ArrivalStage key={mission.id} mission={mission} online={online} atArrival={!!mission.arrival?.all_arrived && frameIndex === frames.length - 1} onJumpToArrival={() => { setPlaying(false); setFrameIndex(Math.max(0, frames.length - 1)); }} onError={setError} onCreated={next => adoptStage(next, mission.id, missionEpoch)} />}
               <section className="panel fleet-panel">
                 <div className="panel-header">
                   <div className="tabs">
@@ -1900,7 +1976,7 @@ function App() {
                                     <i />
                                     {a.status === "failed"
                                       ? "Отказ"
-                                      : "Выполняет миссию"}
+                                      : a.arrived ? "В целевой зоне" : a.status === "hold" ? "Ожидание связи" : "Выполняет миссию"}
                                   </span>
                                 </td>
                                 <td className="mono">

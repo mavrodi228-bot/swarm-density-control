@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { ChangeEvent, PointerEvent } from "react";
-import { Circle, ImagePlus, LoaderCircle, Map, MousePointer2, Pentagon, ScanSearch, Square, Trash2, Undo2, Check, X } from "lucide-react";
+import { Circle, ImagePlus, LoaderCircle, Map, MousePointer2, Pentagon, ScanSearch, Square, Trash2, Undo2, Check, X, RotateCcw } from "lucide-react";
 import { api, requestBlob } from "./api";
 
 export type MapPoint = { x: number; y: number };
@@ -18,9 +18,11 @@ type Territory = {
 };
 export type TerritoryTool = "select" | "rectangle" | "circle" | "polygon";
 export type TerritoryWorkspace = { width_m: number; height_m: number };
+export type TerritoryEditReason = "map" | "shape" | "reset";
 type StoredTerritory = {
   map_id: string | null; restricted_zones: RestrictedZone[];
   workspace?: TerritoryWorkspace; workspace_snapshot?: TerritoryWorkspace;
+  suggestions_cleared?: boolean;
 };
 const uid = () => crypto.randomUUID().replaceAll("-", "").slice(0, 12);
 const clamp = (v: number) => Math.max(.005, Math.min(.995, v));
@@ -30,20 +32,21 @@ function validWorkspace(value: unknown): TerritoryWorkspace | undefined {
   const candidate = value as TerritoryWorkspace;
   if (validDimension(candidate.width_m) && validDimension(candidate.height_m)) return { width_m: candidate.width_m, height_m: candidate.height_m };
 }
-const empty = (): StoredTerritory => {
+const empty = (storageKey: string): StoredTerritory => {
   try {
-    const value = JSON.parse(localStorage.getItem("agmen-territory") || "null");
+    const value = JSON.parse(localStorage.getItem(storageKey) || "null");
     return {
       map_id: typeof value?.map_id === "string" ? value.map_id : null,
       restricted_zones: Array.isArray(value?.restricted_zones) ? value.restricted_zones : [],
       workspace: validWorkspace(value?.workspace), workspace_snapshot: validWorkspace(value?.workspace_snapshot),
+      suggestions_cleared: value?.suggestions_cleared === true,
     };
   }
   catch { return { map_id: null, restricted_zones: [] }; }
 };
 
-export function useTerritory(onError: (message: string) => void, online: boolean, onEdit?: (reason: "map" | "shape") => void) {
-  const initial = useRef(empty()).current;
+export function useTerritory(onError: (message: string) => void, online: boolean, onEdit?: (reason: TerritoryEditReason) => void, storageKey = "agmen-territory") {
+  const [initial] = useState(() => empty(storageKey));
   const [maps, setMaps] = useState<Territory[]>([]);
   const [map, setMap] = useState<Territory | null>(null);
   const [mapId, setMapId] = useState<string | null>(initial.map_id);
@@ -63,49 +66,90 @@ export function useTerritory(onError: (message: string) => void, online: boolean
   const [sensitivity, setSensitivity] = useState(.5);
   const [showSuggestions, setShowSuggestions] = useState(true);
   const [expanded, setExpanded] = useState(false);
+  const [resetNotice, setResetNotice] = useState("");
   const anchor = useRef<MapPoint | null>(null);
   const fileInput = useRef<HTMLInputElement | null>(null);
+  const generation = useRef(0);
+  const zoneGeneration = useRef(0);
+  const catalogGeneration = useRef(0);
+  const [loadVersion, setLoadVersion] = useState(0);
+  const [suggestionsCleared, setSuggestionsCleared] = useState(initial.suggestions_cleared || false);
+  const suppressSuggestions = useRef(suggestionsCleared);
+
+  function suppress(value: boolean) { suppressSuggestions.current = value; setSuggestionsCleared(value); }
+  function currentMap(value: Territory): Territory { return suppressSuggestions.current ? { ...value, suggestions: [] } : value; }
+  function invalidate(reload = false) {
+    generation.current += 1; setBusy(false);
+    if (reload) setLoadVersion(value => value + 1);
+  }
+  async function refreshMaps() {
+    if (!online) return;
+    const request = ++catalogGeneration.current;
+    try {
+      const values = await api<Territory[]>("/api/maps");
+      if (request === catalogGeneration.current) setMaps(values);
+    } catch (error) { if (request === catalogGeneration.current) onError((error as Error).message); }
+  }
+  function notifyMapsChanged() { window.dispatchEvent(new Event("agmen-maps-changed")); }
 
   useEffect(() => {
-    localStorage.setItem("agmen-territory", JSON.stringify({
+    localStorage.setItem(storageKey, JSON.stringify({
       map_id: mapId, restricted_zones: shapes, workspace,
       workspace_snapshot: snapshot.current?.mapId === mapId ? snapshot.current.workspace : undefined,
+      suggestions_cleared: suggestionsCleared,
     }));
-  }, [mapId, shapes, workspace]);
+  }, [mapId, shapes, workspace, suggestionsCleared, storageKey]);
   useEffect(() => {
-    if (!online) return;
-    let active = true;
-    api<Territory[]>("/api/maps").then(values => { if (active) setMaps(values); }).catch(error => onError(error.message));
-    return () => { active = false; };
+    void refreshMaps();
+    const changed = () => { void refreshMaps(); };
+    window.addEventListener("agmen-maps-changed", changed);
+    return () => { catalogGeneration.current += 1; window.removeEventListener("agmen-maps-changed", changed); };
   }, [online]);
+  useEffect(() => () => { generation.current += 1; catalogGeneration.current += 1; }, []);
   useEffect(() => {
     if (!mapId || !online) { if (!mapId) { setMap(null); setImage(""); } return; }
     let active = true;
+    const context = generation.current;
     let objectURL = "";
     (async () => {
       try {
         const metadata = await api<Territory>(`/api/maps/${mapId}`);
         const blob = await requestBlob(metadata.image_url);
-        if (!active) return;
+        if (!active || context !== generation.current) return;
         objectURL = URL.createObjectURL(blob);
         const effective = snapshot.current?.mapId === mapId ? snapshot.current.workspace : validWorkspace(metadata);
-        setMap(metadata); setImage(objectURL);
+        setMap(currentMap(metadata)); setImage(objectURL);
         if (effective) { setWorkspace(effective); setDraftWidth(effective.width_m); setDraftHeight(effective.height_m); }
-      } catch (error) { if (active) onError((error as Error).message); }
+      } catch (error) { if (active && context === generation.current) onError((error as Error).message); }
     })();
     return () => { active = false; if (objectURL) URL.revokeObjectURL(objectURL); };
-  }, [mapId, online]);
+  }, [mapId, online, loadVersion]);
 
-  function activate(next: TerritoryTool) { setTool(next); setDraft(null); setVertices([]); anchor.current = null; }
+  function activate(next: TerritoryTool) { setTool(next); setDraft(null); setVertices([]); setResetNotice(""); anchor.current = null; }
   function applyWorkspace(value: TerritoryWorkspace) {
     setWorkspace(value); setDraftWidth(value.width_m); setDraftHeight(value.height_m);
   }
   function restore(id: string | null | undefined, zones: RestrictedZone[] | undefined, dimensions?: TerritoryWorkspace) {
+    invalidate(true); if ((id || null) !== mapId) suppress(false);
     const nextId = id || null, effective = validWorkspace(dimensions);
     snapshot.current = effective ? { mapId: nextId, workspace: effective } : null;
     if (effective) applyWorkspace(effective);
     else if (map?.id === nextId) applyWorkspace({ width_m: map.width_m, height_m: map.height_m });
     setMapId(nextId); setShapes(zones || []); activate("select");
+  }
+  function clearZones() {
+    zoneGeneration.current += 1; suppress(true);
+    setShapes([]); setMap(value => value ? { ...value, suggestions: [] } : value); activate("select");
+    setResetNotice("Зоны очищены. Карта и масштаб сохранены.");
+    onEdit?.("shape");
+  }
+  function resetMap() {
+    invalidate(true); zoneGeneration.current += 1; snapshot.current = null; suppress(false);
+    setMapId(null); setMap(null); setImage(""); setShapes([]); applyWorkspace({ width_m: 80, height_m: 60 });
+    setMethod("dark"); setSensitivity(.5); setShowSuggestions(true); setExpanded(true); activate("select");
+    setResetNotice("Новое поле 80 × 60 м готово. Загрузите другую карту или измените размеры.");
+    if (fileInput.current) fileInput.current.value = "";
+    onEdit?.("reset");
   }
   function setWidth(value: number) {
     setDraftWidth(value);
@@ -162,46 +206,61 @@ export function useTerritory(onError: (message: string) => void, online: boolean
     if (file.size > 4 * 1024 * 1024) { onError("Размер карты должен быть не больше 4 МБ."); return; }
     const dimensions = validWorkspace({ width_m: draftWidth, height_m: draftHeight });
     if (!dimensions) { onError("Укажите ширину и высоту территории от 10 до 10 000 метров."); return; }
+    invalidate();
+    const context = generation.current, zonesAtStart = zoneGeneration.current;
     setBusy(true);
     try {
       const dataURL = await new Promise<string>((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(String(reader.result)); reader.onerror = reject; reader.readAsDataURL(file); });
+      if (context !== generation.current) return;
       const created = await api<Territory>("/api/maps", { name: file.name, image_data_url: dataURL, ...dimensions }, { timeoutMs: 30000 });
+      notifyMapsChanged();
+      if (context !== generation.current) return;
+      if (zonesAtStart === zoneGeneration.current) suppress(false);
       snapshot.current = null; applyWorkspace(validWorkspace(created) || dimensions);
-      setMaps(current => [created, ...current.filter(item => item.id !== created.id)]); setMap(created); setMapId(created.id); setExpanded(true); setShowSuggestions(true);
+      setMaps(current => [created, ...current.filter(item => item.id !== created.id)]); setMap(currentMap(created)); setMapId(created.id); setLoadVersion(value => value + 1); setExpanded(true); setShowSuggestions(true);
       if (created.id !== mapId) setShapes([]);
+      activate("select");
       onEdit?.("map");
       // The detected regions remain suggestions until the user accepts them.
-    } catch (error) { onError((error as Error).message); }
-    finally { setBusy(false); }
+    } catch (error) { if (context === generation.current) onError((error as Error).message); }
+    finally { if (context === generation.current) setBusy(false); }
   }
   async function analyze() {
     if (!map) return;
+    const context = generation.current, zonesAtStart = zoneGeneration.current;
     setBusy(true);
     try {
       const analyzed = await api<Territory>(`/api/maps/${map.id}/analyze`, { method, sensitivity }, { timeoutMs: 30000 });
+      notifyMapsChanged();
+      if (context !== generation.current || zonesAtStart !== zoneGeneration.current) return;
+      suppress(false);
       setMap(analyzed); setShowSuggestions(true);
-    } catch (error) { onError((error as Error).message); }
-    finally { setBusy(false); }
+    } catch (error) { if (context === generation.current) onError((error as Error).message); }
+    finally { if (context === generation.current) setBusy(false); }
   }
   async function calibrate() {
     if (!map) return;
     const dimensions = validWorkspace({ width_m: draftWidth, height_m: draftHeight });
     if (!dimensions) { onError("Укажите ширину и высоту территории от 10 до 10 000 метров."); return; }
+    const context = generation.current;
     setBusy(true);
     try {
       const calibrated = await api<Territory>(`/api/maps/${map.id}/calibrate`, dimensions);
+      notifyMapsChanged();
+      if (context !== generation.current) return;
       snapshot.current = null; applyWorkspace(validWorkspace(calibrated) || dimensions);
-      setMap(calibrated); setMaps(current => current.map(item => item.id === calibrated.id ? calibrated : item)); onEdit?.("map");
+      setMap(currentMap(calibrated)); setMaps(current => current.map(item => item.id === calibrated.id ? calibrated : item)); onEdit?.("map");
     }
-    catch (error) { onError((error as Error).message); }
-    finally { setBusy(false); }
+    catch (error) { if (context === generation.current) onError((error as Error).message); }
+    finally { if (context === generation.current) setBusy(false); }
   }
   function accept(suggestion: Suggestion) {
     const { source: _source, method: _method, confidence: _confidence, ...shape } = suggestion;
     append(shape); setMap(current => current ? { ...current, suggestions: current.suggestions.filter(item => item.id !== suggestion.id) } : current);
   }
-  return { maps, map, mapId, shapes, tool, draft, vertices, image, busy, width, height, draftWidth, draftHeight, method, sensitivity, showSuggestions, expanded, fileInput,
+  return { maps, map, mapId, shapes, tool, draft, vertices, image, busy, width, height, draftWidth, draftHeight, method, sensitivity, showSuggestions, expanded, fileInput, storageKey, resetNotice,
     setMapId: (id: string | null) => {
+      invalidate(true); suppress(false); activate("select");
       snapshot.current = null;
       if (id !== mapId) setShapes([]);
       const selected = maps.find(item => item.id === id);
@@ -209,15 +268,16 @@ export function useTerritory(onError: (message: string) => void, online: boolean
       else applyWorkspace(workspace);
       setMapId(id); onEdit?.("map");
     }, setShapes, setWidth, setHeight, setMethod, setSensitivity, setShowSuggestions, setExpanded,
-    activate, restore, down, move, up, finishPolygon, upload, analyze, calibrate, accept,
+    activate, restore, clearZones, resetMap, refreshMaps, down, move, up, finishPolygon, upload, analyze, calibrate, accept,
     reject: (id: string) => setMap(current => current ? { ...current, suggestions: current.suggestions.filter(item => item.id !== id) } : current),
     remove: (index: number) => { setShapes(current => current.filter((_, i) => i !== index)); onEdit?.("shape"); },
   };
 }
 type Editor = ReturnType<typeof useTerritory>;
 
-export function TerritoryPanel({ editor: e, disabled = false, onActivate }: { editor: Editor; disabled?: boolean; onActivate: () => void }) {
+export function TerritoryPanel({ editor: e, disabled = false, onActivate, additionalZoneCount = 0 }: { editor: Editor; disabled?: boolean; onActivate: () => void; additionalZoneCount?: number }) {
   const locked = disabled || e.busy;
+  const hasZones = additionalZoneCount > 0 || e.shapes.length > 0 || e.vertices.length > 0 || e.draft !== null || (e.map?.suggestions?.length || 0) > 0;
   return <div className="territory-panel">
     <div className="territory-heading">
       <button className="text-button" onClick={() => e.setExpanded(!e.expanded)} aria-expanded={e.expanded}><Map size={17} /> {e.map ? e.map.name : "Своя территория"} <span>{e.expanded ? "−" : "+"}</span></button>
@@ -231,6 +291,14 @@ export function TerritoryPanel({ editor: e, disabled = false, onActivate }: { ed
       {e.tool === "polygon" && <button className="secondary-button small" disabled={locked || e.vertices.length < 3} onClick={e.finishPolygon}><Check size={14} /> Завершить контур</button>}
       <span className="shape-tag">{e.shapes.length} / 32 запретов</span>
     </div>
+    <div className="territory-reset-controls">
+      <div className="territory-reset-actions">
+        <button className="secondary-button small" disabled={disabled || !hasZones} onClick={e.clearZones}><Trash2 size={14} /> Очистить зоны</button>
+        <button className="secondary-button small territory-new-map" disabled={disabled} onClick={e.resetMap}><RotateCcw size={14} /> Новая карта</button>
+      </div>
+      <p>«Очистить зоны» оставляет подложку и размеры. «Новая карта» открывает пустое поле. Сохранённые карты доступны в списке.</p>
+    </div>
+    {e.resetNotice && <p className="territory-reset-notice" role="status">{e.resetNotice}</p>}
     {e.tool !== "select" && <p className="map-notice">{e.tool === "polygon" ? "Отмечайте вершины на карте. Замкните контур кнопкой или нажмите рядом с первой точкой." : "Нажмите и протяните по карте, чтобы задать запретную зону."} Зоны применятся при следующем расчёте.</p>}
     {e.expanded && <div className="territory-settings">
       {e.maps.length > 0 && <label className="field"><span>Сохранённая карта</span><select aria-label="Сохранённая карта" value={e.mapId || ""} disabled={locked} onChange={event => e.setMapId(event.target.value || null)}><option value="">Локальная сетка без подложки</option>{e.maps.map(map => <option key={map.id} value={map.id}>{map.name}</option>)}</select></label>}

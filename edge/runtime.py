@@ -98,7 +98,7 @@ class EdgeRuntime:
             self.state = {
                 "schema_version": 1, "package_id": self.package_id,
                 "mission_id": self.mission["mission_id"], "drone_id": self.mission["drone_id"],
-                "position_m": position, "velocity_mps": [0., 0.], "step": 0,
+                "position_m": position, "velocity_mps": list(self.mission.get("initial_velocity_mps", [0., 0.])), "step": 0,
                 "battery": self.mission["initial_battery_percent"],
                 "connectivity": {"internet": True, "ground_radio": True, "peer_radio": True, "gnss": True},
                 "navigation_valid": True, "mode": "ONLINE", "status": "running",
@@ -269,7 +269,14 @@ class EdgeRuntime:
             return "returning", "Low battery: follow preloaded return route"
         if self.state["status"] in {"completed", "returned"}:
             return self.state["status"], "Mission already finished"
+        if self.mission.get("completion", {}).get("wait_for_arrival") and not links["ground_radio"]:
+            if self.mission["policy"] == "hold":
+                return "holding", "Ground radio lost: preloaded hold policy"
+            if self.mission["policy"] == "return":
+                return "returning", "Ground radio lost: preloaded return policy"
         if self.state["step"] >= limits["max_steps"]:
+            if self.mission.get("completion", {}).get("wait_for_arrival"):
+                return "awaiting_extension", "Computation budget reached before arrival; mission remains incomplete"
             return "returning", "Preloaded mission time limit reached"
         if not links["ground_radio"]:
             if self.mission["policy"] == "hold":
@@ -294,11 +301,16 @@ class EdgeRuntime:
                 desired = np.zeros((1, 2))
                 if status in {"running", "returning"}:
                     destination = np.asarray(self.mission["home_position_m"] if status == "returning" else self.mission["assigned_slot_m"])
-                    if np.linalg.norm(destination - before) <= self.mission["completion"]["arrival_tolerance_m"]:
-                        self.state["status"] = "returned" if status == "returning" else "completed"
-                        if status == "running":
-                            self.state["task_completed"] = True
-                        self._event("mission", "Arrived at the preloaded destination", status=self.state["status"])
+                    completion = self.mission["completion"]
+                    zone = completion.get("assigned_zone_m")
+                    inside_zone = not completion.get("wait_for_arrival") or np.linalg.norm(before - [zone["x"], zone["y"]]) <= zone["radius"] + 1e-8
+                    if np.linalg.norm(destination - before) <= completion["arrival_tolerance_m"] and (status == "returning" or inside_zone):
+                        minimum = self.mission.get("completion", {}).get("minimum_steps", 0)
+                        if status == "returning" or not self.mission.get("completion", {}).get("wait_for_arrival") or self.state["step"] >= minimum:
+                            self.state["status"] = "returned" if status == "returning" else "completed"
+                            if status == "running":
+                                self.state["task_completed"] = True
+                            self._event("mission", "Arrived at the preloaded destination", status=self.state["status"])
                     else:
                         jx, jy = self.initial_flux
                         if peers and status == "running":
@@ -312,7 +324,27 @@ class EdgeRuntime:
                         avoidance = obstacle_boundary_velocity(before[None], self.rectangles, self.width, self.height, self.cfg.obstacle_margin_m, .85 * self.cfg.max_speed_mps)
                         # Return routing uses the original slot obstacle planner;
                         # a target-density flux would point away from home.
-                        desired = slot + avoidance if status == "returning" else self.cfg.field_weight * macro + self.cfg.slot_weight * slot + avoidance
+                        terminal_approach = (self.mission.get("completion", {}).get("wait_for_arrival")
+                                             and self.state["step"] >= self.mission["completion"]["minimum_steps"])
+                        desired = slot + avoidance if status == "returning" or terminal_approach else self.cfg.field_weight * macro + self.cfg.slot_weight * slot + avoidance
+                        if terminal_approach and np.linalg.norm(desired) <= .05 and self.rectangles:
+                            # The corner router can select its current expanded
+                            # corner as a waypoint. Move outward through the same
+                            # controller; never project or teleport the device.
+                            candidates = []
+                            margin = self.cfg.obstacle_margin_m
+                            for x0, y0, x1, y1 in self.rectangles:
+                                for x, y, sx, sy in ((x0-margin, y0-margin, -1, -1), (x0-margin, y1+margin, -1, 1),
+                                                     (x1+margin, y0-margin, 1, -1), (x1+margin, y1+margin, 1, 1)):
+                                    distance = np.linalg.norm(before - [x, y])
+                                    if distance < .45:
+                                        goal = np.clip(before + np.asarray([sx, sy]) * .7, [.5, .5], [self.width-.5, self.height-.5])
+                                        if not any(_segment_intersects_rect(before, goal, rectangle, .15) for rectangle in self.rectangles):
+                                            candidates.append((distance, goal))
+                            if candidates:
+                                goal = min(candidates, key=lambda candidate: candidate[0])[1]
+                                desired = slot_guidance_velocity(before[None], goal[None], self.rectangles, self.cfg) + avoidance
+                                self._event("navigation", "Applied an outward corner navigation goal", goal_m=goal.tolist())
                         if peers:
                             separation, _, _ = separation_velocity(np.asarray([before, *peers]), self.cfg.min_separation_m, self.cfg.safety_gain, .95 * self.cfg.max_speed_mps)
                             desired += separation[:1]
@@ -323,7 +355,7 @@ class EdgeRuntime:
                 moved = _prevent_rect_crossing(before[None], proposed, self.rectangles, self.width, self.height)[0]
                 # Confirmed territory restrictions cover whole swept segments,
                 # including steps whose endpoints both lie outside an obstacle.
-                if self.map.get("restricted_zones") and any(
+                if (self.map.get("restricted_zones") or self.mission.get("completion", {}).get("wait_for_arrival")) and any(
                         _segment_intersects_rect(before, moved, rectangle, .15) for rectangle in self.rectangles):
                     moved = before.copy()
                 if not np.allclose(moved, proposed[0], atol=1e-10):

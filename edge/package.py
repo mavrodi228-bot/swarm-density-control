@@ -101,6 +101,23 @@ def _validate_content(package):
     battery = mission.get("initial_battery_percent")
     if not isinstance(battery, (int, float)) or not math.isfinite(battery) or not 0 <= battery <= 100:
         raise PackageError("Invalid initial battery state")
+    initial_velocity = _vector(mission.get("initial_velocity_mps", [0., 0.]), 2, "initial velocity")
+    if np.linalg.norm(initial_velocity) > limits["max_speed_mps"] + 1e-9:
+        raise PackageError("Initial velocity exceeds the mission speed limit")
+    completion = mission.get("completion", {})
+    if not isinstance(completion.get("wait_for_arrival", False), bool):
+        raise PackageError("Invalid arrival policy")
+    if completion.get("wait_for_arrival"):
+        minimum = completion.get("minimum_steps")
+        if isinstance(minimum, bool) or not isinstance(minimum, int) or not 1 <= minimum <= limits["max_steps"]:
+            raise PackageError("Invalid minimum mission horizon")
+        zone = completion.get("assigned_zone_m")
+        if not isinstance(zone, dict):
+            raise PackageError("Arrival policy requires its assigned target zone")
+        centre = _vector([zone.get("x"), zone.get("y")], 2, "assigned zone centre")
+        radius = zone.get("radius")
+        if not 0 <= centre[0] <= width or not 0 <= centre[1] <= height or not isinstance(radius, (int, float)) or not math.isfinite(radius) or radius <= 0 or radius > max(width, height):
+            raise PackageError("Invalid assigned target zone")
     tolerance = mission.get("completion", {}).get("arrival_tolerance_m")
     if not isinstance(tolerance, (int, float)) or not math.isfinite(tolerance) or not .1 <= tolerance <= 10:
         raise PackageError("Invalid mission completion tolerance")
@@ -193,6 +210,12 @@ def build_package(mission: dict, drone_id: int, policy="continue", coordination=
         model_data = {"architecture": "SwarmUNet", "encoding": "float32-json-v1", "id": model_id, "state_dict": {name: {"shape": list(value.shape), "values": value.detach().cpu().numpy().ravel().tolist()} for name, value in model.state_dict().items()}}
     cfg = FleetSimConfig()
     own = agents[drone_id - 1]
+    wait_for_arrival = bool(config.get("wait_for_arrival", False))
+    execution_budget = min(10000, max(config["steps"], int(config.get("max_completion_steps", 1200)))) if wait_for_arrival else config["steps"]
+    zone_index = own.get("target_zone_index")
+    if zone_index is None:
+        zone_index = max(0, int(labels[assignment[drone_id - 1]][1:]) - 1)
+    selected_zone = zones[zone_index]
     package = {
         "mission": {
             "mission_id": str(mission["id"]), "drone_id": drone_id,
@@ -201,11 +224,19 @@ def build_package(mission: dict, drone_id: int, policy="continue", coordination=
             "controller_version": "density-flux-1", "model_id": config.get("model_id", "bundled") if model_data else None,
             "initial_position_m": positions[drone_id - 1].tolist(), "home_position_m": positions[drone_id - 1].tolist(),
             "initial_battery_percent": float(own.get("battery", 100)),
-            "assigned_slot_m": selected_slot.tolist(), "assigned_zone": labels[assignment[drone_id - 1]],
+            "initial_velocity_mps": [float(own.get("speed", 0)) * math.cos(float(own.get("heading", 0))),
+                                     float(own.get("speed", 0)) * math.sin(float(own.get("heading", 0)))],
+            "source_drone_id": own.get("source_drone_id", drone_id), "stage": mission.get("stage"),
+            "assigned_slot_m": selected_slot.tolist(), "assigned_zone": f"T{zone_index + 1}",
             "route_m": [positions[drone_id - 1].tolist(), selected_slot.tolist()],
-            "limits": {"max_speed_mps": config["max_speed"], "max_accel_mps2": cfg.max_accel_mps2, "altitude_m": 20., "max_steps": config["steps"], "low_battery_percent": 20.},
+            "limits": {"max_speed_mps": config["max_speed"], "max_accel_mps2": cfg.max_accel_mps2, "altitude_m": 20., "max_steps": execution_budget, "low_battery_percent": 20.},
             "controller_parameters": {name: getattr(cfg, name) for name in ("slot_gain", "field_weight", "slot_weight", "obstacle_margin_m", "min_separation_m", "safety_gain")},
-            "completion": {"arrival_tolerance_m": 1.0, "on_time_limit": "return"},
+            "completion": {"arrival_tolerance_m": 1.0, "on_time_limit": "hold" if wait_for_arrival else "return",
+                           "wait_for_arrival": wait_for_arrival, "minimum_steps": config["steps"],
+                           "assigned_zone_m": {"x": selected_zone["x"] * width, "y": selected_zone["y"] * height,
+                                               "radius": selected_zone.get("radius", .12) * min(width, height)},
+                           "terminal_guidance": "slot_after_minimum" if wait_for_arrival else None,
+                           "scope": "own_vehicle; group arrival is measured by the ground simulation"},
             "logging": {"max_entries": 2048, "max_history": 1024}, "simulation_only": True,
         },
         "map": {"coordinate_system": "local_planar_metres", "geographic_origin": None, "workspace": workspace,

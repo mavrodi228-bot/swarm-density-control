@@ -33,7 +33,7 @@ def completed(client, identifier, timeout=40):
 
 def mission(client, **overrides):
     config = dict(name="API integration", drone_count=5, steps=20, max_speed=2,
-                  safe_distance=1, obstacle="none", scenario="clusters")
+                  safe_distance=1, obstacle="none", scenario="clusters", wait_for_arrival=False)
     config.update(overrides)
     response = client.post("/api/missions", json=config)
     assert response.status_code == 202, response.text

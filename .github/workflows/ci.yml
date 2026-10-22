@@ -38,7 +38,7 @@ jobs:
           else:
               raise SystemExit('AGMEN healthcheck failed')
           PY
-      - run: npm run test:smoke && npm run test:research && npm run test:connection && npm run test:territory && npm run test:themes
+      - run: npm run test:territory-hooks && npm run test:smoke && npm run test:research && npm run test:connection && npm run test:territory && npm run test:arrival && npm run test:themes
         working-directory: frontend
         env:
           AGMEN_PYTHON: python

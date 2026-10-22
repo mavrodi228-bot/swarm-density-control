@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+import copy
 import csv
 import hmac
 import io
@@ -27,6 +28,9 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from agmen_simulation import CONTROLLERS, simulate
 from territory import (MapStore, MapUpload, MapAnalysis, MapCalibration, RestrictedZone,
                        restricted_mask, mask_rectangles, initial_free_positions)
+from mission_stages import (NextStageConfig, ContinueConfig, build_stage, build_continuation,
+                            stage_options, stage_eligibility, continuation_eligibility,
+                            validate_stage_reachability)
 
 LOG = logging.getLogger("agmen")
 ROOT = Path(__file__).resolve().parent
@@ -53,6 +57,8 @@ class MissionConfig(BaseModel):
     model_id: str = Field(default="bundled", pattern=r"^(bundled|[a-f0-9]{32})$")
     scenario: Literal["distribution", "clusters", "patrol", "survey", "scan", "return"] = "distribution"
     steps: int = Field(default=100, ge=20, le=300)
+    wait_for_arrival: bool = True
+    arrival_tolerance_m: float | None = Field(default=None, ge=.1, le=10)
     seed: int = Field(default=42, ge=0, le=2147483547)
     max_speed: float = Field(default=5, ge=.1, le=15)
     safe_distance: float = Field(default=1.5, ge=.25, le=8)
@@ -68,7 +74,7 @@ class EventConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     kind: Literal["drone_failure", "link_loss", "target_change"]
     drone_id: int | None = Field(default=None, ge=1, le=500)
-    step: int | None = Field(default=None, ge=1, le=299)
+    step: int | None = Field(default=None, ge=1, le=10000)
     targets: list[Target] | None = Field(default=None, min_length=1, max_length=32)
 
     @model_validator(mode="after")
@@ -225,13 +231,15 @@ def create_app(state_dir: str | Path | None = None) -> FastAPI:
     app.state.get_mission = lambda identifier: get_record(identifier, "mission")
 
     def brief(record: dict) -> dict:
-        return {key: record.get(key) for key in ("id", "name", "kind", "status", "created_at", "updated_at", "config", "summary", "error", "results", "best") if key in record}
+        return {key: record.get(key) for key in ("id", "name", "kind", "status", "created_at", "updated_at", "config", "summary", "arrival", "progress", "workspace", "stage", "parent_id", "error", "results", "best") if key in record}
 
-    def check_config(config: dict):
+    def check_config(config: dict, *, resolve_map=True):
         if config["drone_count"] > limits["max_drones"] or config["steps"] > limits["max_steps"]:
             raise HTTPException(422, f"{profile_name} profile permits at most {limits['max_drones']} drones and {limits['max_steps']} steps")
         _inference(config["controller"], config.get("model_id", "bundled"))
-        if config.get("map_id"):
+        if config.get("wait_for_arrival"):
+            config["max_completion_steps"] = 600 if profile_name == "public" else 1200
+        if config.get("map_id") and resolve_map:
             try:
                 snapshot = maps.get(config["map_id"])
             except FileNotFoundError as error:
@@ -251,14 +259,15 @@ def create_app(state_dir: str | Path | None = None) -> FastAPI:
             combined = custom | obstacle_mask(GRID, OBSTACLES[config["obstacle"]])
             if combined.all():
                 raise HTTPException(422, "Restrictions cover the entire territory")
-            for target in config.get("targets") or []:
+            for target in ([] if config.get("initial_assigned_slots_m") else config.get("targets") or []):
                 if custom[min(GRID-1, int(target["y"]*GRID)), min(GRID-1, int(target["x"]*GRID))]:
                     raise HTTPException(422, "A target lies inside a restricted grid cell; move the target or change the restriction")
             try:
                 rects = obstacle_rectangles(OBSTACLES[config["obstacle"]], width, height) + mask_rectangles(custom, width, height)
                 if len(rects) > 256:
                     raise ValueError("Restrictions exceed the planning budget; simplify the shapes")
-                initial_free_positions(config["drone_count"], rects, width, height, config["seed"])
+                if "initial_positions_m" not in config:
+                    initial_free_positions(config["drone_count"], rects, width, height, config["seed"])
             except ValueError as error:
                 raise HTTPException(422, str(error)) from error
 
@@ -284,7 +293,7 @@ def create_app(state_dir: str | Path | None = None) -> FastAPI:
     app.state.submit_background = submit_background
     app.state.agmen_profile = profile
 
-    def enqueue(kind: str, name: str, config: dict, work) -> dict:
+    def enqueue(kind: str, name: str, config: dict, work, metadata: dict | None = None, *, track_progress=False) -> dict:
         memory_admission()
         with lock:
             if sum(r["kind"] == kind for r in records.values()) >= limits["max_missions"]:
@@ -293,7 +302,7 @@ def create_app(state_dir: str | Path | None = None) -> FastAPI:
                 raise HTTPException(429, "Simulation queue is full. Wait for an active run to finish.")
             identifier = uuid.uuid4().hex[:12]
             record = {"id": identifier, "kind": kind, "name": name, "status": "queued",
-                      "config": config, "created_at": now(), "updated_at": now()}
+                      "config": config, "created_at": now(), "updated_at": now(), **(metadata or {})}
             records[identifier] = record
             try:
                 persist(record)
@@ -302,16 +311,20 @@ def create_app(state_dir: str | Path | None = None) -> FastAPI:
                 capacity.release()
                 raise HTTPException(507, "Unable to persist run; check disk space and state directory permissions")
             result = brief(record)
-        submit(record, work)
+        submit(record, work, track_progress=track_progress)
         return result
 
-    def submit(record: dict, work):
+    def submit(record: dict, work, *, track_progress=False):
+        def progress(value):
+            with lock:
+                record.update(progress=dict(value), updated_at=now())
+                persist(record)
         def run():
             try:
                 with lock:
                     record.update(status="running", updated_at=now())
                     persist(record)
-                output = work()
+                output = work(progress) if track_progress else work()
                 with lock:
                     record.update(output)
                     record.update(status="completed", updated_at=now())
@@ -393,12 +406,66 @@ def create_app(state_dir: str | Path | None = None) -> FastAPI:
     def create_mission(config: MissionConfig):
         data = config.model_dump()
         check_config(data)
-        return enqueue("mission", config.name, data, lambda: simulate(data, *_inference(config.controller, config.model_id)))
+        return enqueue("mission", config.name, data,
+                       lambda progress: simulate(data, *_inference(config.controller, config.model_id), progress_callback=progress),
+                       track_progress=True)
 
     @app.get("/api/missions/{identifier}")
     def mission(identifier: str):
         with lock:
             return dict(get_record(identifier))
+
+    @app.get("/api/missions/{identifier}/next-stage-options")
+    def next_stage_options(identifier: str):
+        with lock:
+            record = copy.deepcopy(get_record(identifier))
+            children = [brief(r) for r in records.values() if r.get("parent_id") == identifier]
+        return stage_options(record, children)
+
+    def queue_continuation(data: dict, stage: dict, *, check_reachability: bool):
+        check_config(data, resolve_map=False)
+        try:
+            from agmen_simulation import validate_continuation
+            validate_continuation(data)
+            if check_reachability:
+                validate_stage_reachability(data)
+        except ValueError as error:
+            raise HTTPException(422, str(error)) from error
+        return enqueue("mission", data["name"], data,
+                       lambda progress: simulate(data, *_inference(data["controller"], data.get("model_id", "bundled")), progress_callback=progress),
+                       metadata={"parent_id": stage["parent_id"], "stage": stage}, track_progress=True)
+
+    @app.post("/api/missions/{identifier}/next-stage", status_code=202)
+    def next_stage(identifier: str, request: NextStageConfig):
+        with lock:
+            record = copy.deepcopy(get_record(identifier))
+        allowed, reason = stage_eligibility(record)
+        if not allowed:
+            raise HTTPException(409, reason)
+        snapshot = None
+        if request.map_id:
+            try:
+                snapshot = maps.get(request.map_id)
+            except FileNotFoundError as error:
+                raise HTTPException(422, "Подробная карта не найдена; загрузите или выберите сохранённую карту") from error
+        try:
+            data, stage = build_stage(record, request, snapshot)
+        except ValueError as error:
+            raise HTTPException(422, str(error)) from error
+        return queue_continuation(data, stage, check_reachability=True)
+
+    @app.post("/api/missions/{identifier}/continue", status_code=202)
+    def continue_arrival(identifier: str, request: ContinueConfig | None = None):
+        with lock:
+            record = copy.deepcopy(get_record(identifier))
+        allowed, reason = continuation_eligibility(record)
+        if not allowed:
+            raise HTTPException(409, reason)
+        try:
+            data, stage = build_continuation(record, request or ContinueConfig())
+        except (ValueError, KeyError) as error:
+            raise HTTPException(422, str(error)) from error
+        return queue_continuation(data, stage, check_reachability=False)
 
     @app.post("/api/missions/{identifier}/events", status_code=202)
     def inject_event(identifier: str, event: EventConfig):
@@ -407,10 +474,13 @@ def create_app(state_dir: str | Path | None = None) -> FastAPI:
             record = get_record(identifier)
             if record["status"] != "completed":
                 raise HTTPException(409, "Wait for the mission to complete before replaying an event")
+            if any(r.get("parent_id") == identifier for r in records.values()):
+                raise HTTPException(409, "Для миссии уже создано продолжение. Создайте отдельную миссию для проверки нового события.")
             data = record["config"]
             event_data = event.model_dump(exclude_none=True)
-            event_data.setdefault("step", max(1, data["steps"] // 2))
-            if event_data["step"] >= data["steps"] or event_data.get("drone_id", 1) > data["drone_count"]:
+            actual_steps = (record.get("summary") or {}).get("actual_steps", data["steps"])
+            event_data.setdefault("step", max(1, actual_steps // 2))
+            if event_data["step"] >= actual_steps or event_data.get("drone_id", 1) > data["drone_count"]:
                 raise HTTPException(422, "Event step or vehicle id is outside this mission")
             if len(record.get("events", [])) >= 16:
                 raise HTTPException(422, "At most 16 fault/target events are permitted")
@@ -427,7 +497,7 @@ def create_app(state_dir: str | Path | None = None) -> FastAPI:
                 capacity.release()
                 raise HTTPException(507, "Unable to persist event replay; check disk space") from exc
             response = brief(record)
-        submit(record, lambda: simulate(data, *_inference(data["controller"], data.get("model_id", "bundled")), events=events))
+        submit(record, lambda progress: simulate(data, *_inference(data["controller"], data.get("model_id", "bundled")), events=events, progress_callback=progress), track_progress=True)
         return response
 
     @app.get("/api/missions/{identifier}/export")
@@ -489,7 +559,7 @@ def create_app(state_dir: str | Path | None = None) -> FastAPI:
             results = []
             for count in config.counts:
                 for controller in config.controllers:
-                    data = MissionConfig(drone_count=count, controller=controller, steps=config.steps, seed=config.seed).model_dump()
+                    data = MissionConfig(drone_count=count, controller=controller, steps=config.steps, seed=config.seed, wait_for_arrival=False).model_dump()
                     result = simulate(data, *_inference(controller), include_frames=False)
                     results.append({"drone_count": count, "controller": controller, **result["summary"], "history": result["history"]})
             return {"results": results, "summary": {"combinations": len(results), "simulation_only": True}}
@@ -511,7 +581,7 @@ def create_app(state_dir: str | Path | None = None) -> FastAPI:
         def work():
             results = []
             for gain in config.gains:
-                data = MissionConfig(steps=config.steps, seed=config.seed).model_dump()
+                data = MissionConfig(steps=config.steps, seed=config.seed, wait_for_arrival=False).model_dump()
                 run = simulate(data, slot_gain=gain, include_frames=False)
                 results.append({"gain": gain, **run["summary"], "history": run["history"]})
             best = min(results, key=lambda r: r["mae"])

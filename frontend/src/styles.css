@@ -2562,7 +2562,7 @@ button:disabled:hover { color: var(--disabled-text); background: var(--disabled-
 .terrain-restricted { stroke: var(--danger); stroke-width: 1.8; fill: var(--danger); fill-opacity: .17; vector-effect: non-scaling-stroke; }
 .terrain-draft { stroke: var(--accent); stroke-width: 1.8; stroke-dasharray: 6 4; fill: var(--accent); fill-opacity: .1; vector-effect: non-scaling-stroke; pointer-events: none; }
 .terrain-draft polyline { fill: none; }
-.terrain-suggestion text, .terrain-restricted text, .mission-map text[fill="var(--warning)"] {
+.terrain-suggestion text, .terrain-restricted text, .map-zone-label, .mission-map text[fill="var(--warning)"] {
   fill: var(--map-annotation-text);
   fill-opacity: 1;
   stroke: var(--map-annotation-halo);
@@ -2864,4 +2864,120 @@ button:disabled:hover { color: var(--disabled-text); background: var(--disabled-
 }
 @media (prefers-reduced-motion: reduce) {
   *, *:before, *:after { transition: none !important; animation: none !important; }
+}
+
+/* Territory reset actions: explicit editor operations, separate from archived maps. */
+.territory-reset-controls {
+  display: flex;
+  align-items: center;
+  gap: 17px;
+  padding: 15px 22px 18px;
+  border-top: 1px solid var(--line-soft);
+  background: var(--input);
+}
+.territory-reset-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.territory-reset-controls p { max-width: 540px; font-size: 11px; line-height: 1.6; color: var(--muted); }
+.territory-new-map { color: var(--accent); border-color: var(--accent-line); background: var(--accent-soft); }
+.territory-new-map:hover { color: var(--accent-hover); border-color: var(--accent); background: var(--accent-soft); }
+.territory-reset-notice {
+  margin: 15px 22px;
+  padding: 12px 14px;
+  border: 1px solid var(--positive-line);
+  border-radius: 8px;
+  background: var(--positive-soft);
+  color: var(--positive);
+  font-size: 12px;
+  line-height: 1.6;
+}
+@media (max-width: 1300px) {
+  .territory-reset-controls { align-items: flex-start; flex-direction: column; gap: 11px; }
+}
+@media (max-width: 600px) {
+  .territory-reset-controls { padding: 15px 17px; }
+  .territory-reset-actions { width: 100%; flex-wrap: wrap; }
+  .territory-reset-actions > button { flex: 1; white-space: nowrap; }
+  .territory-reset-controls p { font-size: 11px; }
+  .territory-reset-notice { margin: 15px 17px; font-size: 11px; }
+}
+
+/* Arrival and destination planning share the field notebook palette. */
+.mission-lineage { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; color: var(--muted); padding: 0 2px 18px; }
+.mission-lineage > svg { color: var(--accent); }
+.mission-lineage .text-button { margin-left: auto; }
+.arrival-progress { display: flex; align-items: center; flex-wrap: wrap; gap: 13px 24px; padding: 20px 23px; margin-bottom: 22px; background: var(--positive-soft); border: 1px solid var(--positive-line); border-radius: var(--radius); }
+.arrival-progress > div { display: flex; flex-direction: column; gap: 5px; }
+.arrival-progress strong { color: var(--positive); font-size: 14px; }
+.arrival-progress span, .arrival-progress small { color: var(--muted); font-size: 12px; }
+.arrival-progress progress { flex: 1; min-width: 100px; max-width: 380px; height: 8px; margin-left: auto; accent-color: var(--positive); }
+.arrival-progress progress::-webkit-progress-bar { background: var(--panel); border-radius: 10px; }
+.arrival-progress progress::-webkit-progress-value { background: var(--positive); border-radius: 10px; }
+.arrival-progress > small { width: 100%; }
+.arrival-progress.incomplete { background: var(--warning-soft); border-color: var(--warning-line); }
+.arrival-progress.incomplete strong { color: var(--warning); }
+.arrival-progress > p { width: 100%; color: var(--text); font-size: 13px; line-height: 1.65; }
+.wait-arrival-option { display: flex; align-items: flex-start; gap: 10px; padding: 14px; border: 1px solid var(--positive-line); border-radius: 9px; background: var(--positive-soft); }
+.wait-arrival-option > input { width: 17px; height: 17px; min-width: 17px; padding: 0; flex-shrink: 0; margin-top: 3px; accent-color: var(--positive); }
+.wait-arrival-option > span { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 6px; }
+.wait-arrival-option strong { font-size: 12px; color: var(--text); font-weight: 600; }
+.wait-arrival-option small { font-size: 11px; line-height: 1.6; color: var(--muted); }
+.arrival-stage { margin-top: 24px; overflow: hidden; }
+.arrival-stage > .panel-header { gap: 15px; flex-wrap: wrap; }
+.arrival-intro { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 25px; padding: 25px; }
+.arrival-step { display: flex; align-items: flex-start; gap: 12px; min-width: 0; }
+.arrival-step > span { width: 30px; height: 30px; flex-shrink: 0; display: grid; place-items: center; border: 1px solid var(--line); border-radius: 9px; font: 11px Consolas, monospace; color: var(--muted); }
+.arrival-step.ready > span { background: var(--positive-soft); color: var(--positive); border-color: var(--positive-line); }
+.arrival-step strong { font-size: 13px; color: var(--text); }
+.arrival-step p { color: var(--muted); font-size: 12px; line-height: 1.65; margin-top: 7px; }
+.stage-planner { padding: 0 25px 25px; }
+.stage-notice { display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap; color: var(--muted); background: var(--input); border: 1px solid var(--line-soft); border-radius: 9px; font-size: 12px; line-height: 1.65; padding: 14px 17px; margin: 0 25px 20px; }
+.stage-planner > .stage-notice { margin-left: 0; margin-right: 0; }
+.stage-notice.warning { background: var(--warning-soft); color: var(--text); border-color: var(--warning-line); }
+.stage-scenarios { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+.stage-scenario { display: flex; flex-direction: column; align-items: flex-start; gap: 10px; padding: 20px; text-align: left; color: var(--muted); background: var(--input); border: 1px solid var(--line); border-radius: 11px; min-width: 0; }
+.stage-scenario > svg { color: var(--accent); }
+.stage-scenario > strong { font-size: 14px; color: var(--text); }
+.stage-scenario > span { font-size: 12px; line-height: 1.65; }
+.stage-scenario small { margin-top: auto; color: var(--positive); font-size: 11px; }
+.stage-scenario.selected { border-color: var(--accent); background: var(--accent-soft); box-shadow: inset 0 0 0 1px var(--accent); }
+.stage-registration { display: grid; grid-template-columns: minmax(0, 1.3fr) repeat(2, minmax(110px, .5fr)) auto; align-items: end; gap: 18px; margin: 24px 0; padding: 22px; background: var(--input); border: 1px solid var(--line-soft); border-radius: 10px; }
+.stage-registration strong { font-size: 13px; }
+.stage-registration p { color: var(--muted); font-size: 12px; line-height: 1.65; margin-top: 7px; max-width: 420px; }
+.destination-map-panel { border: 1px solid var(--line); border-radius: 11px; overflow: hidden; }
+.destination-map-heading { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; padding: 19px 22px; border-bottom: 1px solid var(--line-soft); font-size: 13px; }
+.destination-map-heading svg { color: var(--accent); }
+.destination-map-heading > span { margin-left: auto; color: var(--muted); font-size: 12px; }
+.destination-map { width: 100%; height: auto; max-height: 580px; display: block; background: var(--map-bg); touch-action: none; }
+.destination-map.draw-mode { cursor: crosshair; }
+.stage-scenario-preview { stroke: var(--positive); stroke-width: 2; stroke-dasharray: 7 6; fill: var(--positive); fill-opacity: .09; }
+.stage-source-agent circle { fill: var(--map-annotation-text); stroke: var(--map-annotation-halo); stroke-width: 2px; }
+.stage-map-legend { display: flex; align-items: center; flex-wrap: wrap; gap: 12px 22px; padding: 15px 21px; color: var(--muted); font-size: 11px; border-top: 1px solid var(--line-soft); }
+.stage-map-legend > span { display: flex; align-items: center; gap: 7px; }
+.stage-map-legend i { display: inline-block; width: 7px; height: 7px; background: var(--text); border-radius: 50%; }
+.stage-submit { display: flex; align-items: center; justify-content: space-between; gap: 25px; margin-top: 23px; }
+.stage-submit p { max-width: 650px; color: var(--muted); font-size: 12px; line-height: 1.7; }
+.stage-submit > button { flex-shrink: 0; min-width: 220px; }
+@media (max-width: 1150px) {
+  .arrival-intro { gap: 20px; }
+  .stage-scenarios { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .stage-registration { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .stage-registration > div { grid-column: 1 / -1; }
+  .stage-submit { align-items: flex-start; flex-direction: column; }
+}
+@media (max-width: 600px) {
+  .arrival-progress { padding: 18px; gap: 15px; }
+  .arrival-progress progress { max-width: none; width: 100%; flex-basis: 100%; }
+  .arrival-stage > .panel-header { padding: 18px; }
+  .arrival-stage .panel-header > button { width: 100%; justify-content: center; }
+  .arrival-stage .section-title > .subtle { display: none; }
+  .arrival-intro { grid-template-columns: 1fr; padding: 20px 18px; gap: 20px; }
+  .stage-planner { padding: 0 17px 20px; }
+  .stage-notice { margin: 0 17px 17px; padding: 13px; }
+  .stage-scenarios { grid-template-columns: 1fr; }
+  .stage-scenario { padding: 17px; gap: 9px; }
+  .stage-registration { padding: 16px; gap: 14px 10px; }
+  .stage-registration > button { grid-column: 1 / -1; }
+  .stage-registration .field > span { font-size: 11px; }
+  .destination-map-heading { padding: 16px; }
+  .stage-map-legend { padding: 14px; font-size: 11px; }
+  .stage-submit > button { width: 100%; min-width: 0; }
 }
