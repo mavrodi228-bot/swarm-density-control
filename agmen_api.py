@@ -413,7 +413,10 @@ def create_app(state_dir: str | Path | None = None) -> FastAPI:
     @app.get("/api/missions/{identifier}")
     def mission(identifier: str):
         with lock:
-            return dict(get_record(identifier))
+            snapshot = dict(get_record(identifier))
+        # Encode large frame histories in this sync handler's worker thread.
+        # Returning a dict makes FastAPI traverse it on the event loop instead.
+        return JSONResponse(snapshot)
 
     @app.get("/api/missions/{identifier}/next-stage-options")
     def next_stage_options(identifier: str):

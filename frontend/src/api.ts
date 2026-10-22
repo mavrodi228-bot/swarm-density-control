@@ -1,4 +1,8 @@
 export const CONNECTION_EVENT = "agmen:connection-error";
+const TIMEOUT_MESSAGE = "Сервер не ответил вовремя";
+
+// Editors also forward plain error messages to the application's banner.
+export const isTimeoutMessage = (message: string) => message.startsWith(`${TIMEOUT_MESSAGE} (`);
 
 export class ApiError extends Error {
   constructor(
@@ -6,6 +10,7 @@ export class ApiError extends Error {
     public readonly path: string,
     public readonly status?: number,
     public readonly transport = false,
+    public readonly timedOut = false,
   ) {
     super(message);
     this.name = "ApiError";
@@ -81,15 +86,18 @@ async function request<T>(
     } catch (error) {
       if (error instanceof ApiError) failure = error;
       else {
-        const reason = controller.signal.aborted ? "Сервер не ответил вовремя" : "Нет соединения с локальным сервером";
+        const timedOut = controller.signal.aborted;
+        const reason = timedOut ? TIMEOUT_MESSAGE : "Нет соединения с локальным сервером";
         const instruction = isRead
-          ? "Запустите RUN_AGMEN.cmd. Подключение восстановится автоматически."
+          ? timedOut ? "Ответ задерживается. Ожидание продолжится автоматически." : "Запустите RUN_AGMEN.cmd. Подключение восстановится автоматически."
           : "Результат команды неизвестен. После восстановления связи проверьте список задач перед повторным запуском.";
-        failure = new ApiError(`${reason} (${path}). ${instruction}`, path, undefined, true);
+        failure = new ApiError(`${reason} (${path}). ${instruction}`, path, undefined, true, timedOut);
       }
-      reportConnectionError(failure);
       const retryable = failure.transport || [502, 503, 504].includes(failure.status ?? 0);
-      if (!retryable || attempt === attempts - 1) throw failure;
+      if (!retryable || attempt === attempts - 1) {
+        reportConnectionError(failure);
+        throw failure;
+      }
     } finally {
       window.clearTimeout(timeout);
     }

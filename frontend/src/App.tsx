@@ -1,6 +1,6 @@
 import { cloneElement, isValidElement, useEffect, useRef, useState } from "react";
 import type { ReactElement, ReactNode } from "react";
-import { api, download, CONNECTION_EVENT, ApiError } from "./api";
+import { api, download, CONNECTION_EVENT, ApiError, isTimeoutMessage } from "./api";
 import { useTerritory, TerritoryPanel, TerritoryBackground, TerritoryLayers } from "./TerritoryMap";
 import type { RestrictedZone } from "./TerritoryMap";
 import { ArrivalStage } from "./ArrivalStage";
@@ -380,6 +380,7 @@ function App() {
   });
   const [reconnecting, setReconnecting] = useState(true);
   const [connectionIssue, setConnectionIssue] = useState("");
+  const [responsePending, setResponsePending] = useState(false);
   const [frameIndex, setFrameIndex] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [speed, setSpeed] = useState(1);
@@ -448,6 +449,8 @@ function App() {
   const profile = typeof boot?.profile === "object" ? boot.profile : undefined;
   const maxDrones = profile?.limits?.max_drones || 500;
   const maxSteps = profile?.limits?.max_steps || 300;
+  const visibleError = isTimeoutMessage(error) ? "" : error;
+  const waitingForResponse = responsePending || isTimeoutMessage(error);
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
     localStorage.setItem("agmen-theme", theme);
@@ -504,14 +507,22 @@ function App() {
         connected = true;
         failures = 0;
         setOnline(true);
+        setResponsePending(false);
         setConnectionIssue("");
         setError((previous) => previous.includes("/api/") ? "" : previous);
       } catch (e) {
         if (!live) return;
-        connected = false;
         failures += 1;
-        setOnline(false);
-        setConnectionIssue((e as Error).message);
+        if (e instanceof ApiError && e.timedOut) {
+          // A busy server is still connected. Preserve the active calculation,
+          // draft and polling while the heartbeat waits for a later response.
+          setResponsePending(true);
+        } else {
+          connected = false;
+          setOnline(false);
+          setResponsePending(false);
+          setConnectionIssue((e as Error).message);
+        }
       } finally {
         checking = false;
         if (live) {
@@ -527,8 +538,14 @@ function App() {
     };
     const lost = (event: Event) => {
       const issue = (event as CustomEvent<ApiError>).detail;
+      if (issue.timedOut) {
+        setResponsePending(true);
+        if (!checking) schedule(1000);
+        return;
+      }
       connected = false;
       setOnline(false);
+      setResponsePending(false);
       setConnectionIssue(issue.message);
       setPlaying(false);
       if (!checking) schedule(1000);
@@ -936,9 +953,9 @@ function App() {
             </strong>
           </div>
           <div className="top-actions">
-            <span className={`engine-status ${online ? "" : "disconnected"}`} role="status" title="Соединение браузера с локальным сервером AGMEN; не связано с интернетом EDGE">
+            <span className={`engine-status ${online ? "" : waitingForResponse || reconnecting ? "pending" : "disconnected"}`} role="status" title="Соединение браузера с локальным сервером AGMEN; не связано с интернетом EDGE">
               <i />
-              {online ? "LOCAL ENGINE" : reconnecting ? "ПОДКЛЮЧЕНИЕ…" : "НЕТ СОЕДИНЕНИЯ"}
+              {online ? "LOCAL ENGINE" : waitingForResponse ? "ОЖИДАНИЕ ОТВЕТА…" : reconnecting ? "ПОДКЛЮЧЕНИЕ…" : "НЕТ СОЕДИНЕНИЯ"}
             </span>
             <div className="mode-switch">
               <button
@@ -1001,10 +1018,14 @@ function App() {
               <span className="version">WORKSPACE / 01</span>
             </div>
           </div>
-          {(connectionIssue || error) && (
+          {waitingForResponse && !connectionIssue && <div className="connection-loading" role="status" aria-live="polite" aria-label="Ожидание ответа сервера">
+            <LoaderCircle className="spin" size={18} />
+            <div><strong>{calculating || busy ? "Ожидаем результат расчёта" : "Ожидаем ответ сервера"}</strong><span>{isTimeoutMessage(error) && error.includes("Результат команды неизвестен") ? "Ответ на команду задерживается. После получения ответа проверьте список задач перед повторным запуском." : "Ответ занимает больше времени. Данные обновятся автоматически."}</span></div>
+          </div>}
+          {(connectionIssue || visibleError) && (
             <div role="alert" className="error-banner">
               <TriangleAlert size={18} />
-              <span>{connectionIssue || error}{!online && mission ? " Показаны ранее загруженные результаты." : ""}</span>
+              <span>{connectionIssue || visibleError}{!online && mission ? " Показаны ранее загруженные результаты." : ""}</span>
               <button className="secondary-button small" onClick={() => reconnect.current()} disabled={reconnecting}>
                 <RotateCcw size={14} /> {reconnecting ? "Подключение…" : "Повторить подключение"}
               </button>

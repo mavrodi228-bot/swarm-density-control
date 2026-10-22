@@ -1,4 +1,5 @@
 """API integration tests: physical states, durable jobs, faults, and boundaries."""
+from concurrent.futures import ThreadPoolExecutor
 import json
 import math
 import threading
@@ -91,6 +92,41 @@ def test_exports_are_real_artifacts(client):
 def test_supports_more_than_legacy_hundred_vehicles(client):
     result = mission(client, drone_count=125)
     assert len(result["frames"][-1]["agents"]) == 125
+
+
+def test_health_remains_available_while_mission_response_is_encoded(client, monkeypatch):
+    identifier = "c" * 12
+    agents = [{"id": index + 1, "x": .5, "y": .5, "battery": 99.5}
+              for index in range(101)]
+    record = {"id": identifier, "kind": "mission", "status": "completed",
+              "name": "История большой группы", "summary": {"actual_steps": 300},
+              "frames": [{"step": step, "agents": agents} for step in range(301)]}
+    client.app.state.records[identifier] = record
+    rendering, release = threading.Event(), threading.Event()
+    original_render = agmen_api.JSONResponse.render
+
+    def gated_render(response, content):
+        if isinstance(content, dict) and content.get("id") == identifier and "frames" in content:
+            rendering.set()
+            if not release.wait(10):
+                raise RuntimeError("Mission response rendering was not released")
+        return original_render(response, content)
+
+    monkeypatch.setattr(agmen_api.JSONResponse, "render", gated_render)
+    with ThreadPoolExecutor(max_workers=2) as requests:
+        result = requests.submit(client.get, f"/api/missions/{identifier}")
+        try:
+            assert rendering.wait(5), "Mission rendering did not start"
+            # The explicit gate checks independence from rendering, rather than
+            # relying on the machine's speed when encoding a large JSON body.
+            health = requests.submit(client.get, "/api/health").result(timeout=3)
+            assert health.status_code == 200
+            assert health.json()["status"] == "ok"
+        finally:
+            release.set()
+        response = result.result(timeout=5)
+    assert response.status_code == 200
+    assert response.json() == record
 
 
 def test_validation_origin_and_path_boundaries(client):

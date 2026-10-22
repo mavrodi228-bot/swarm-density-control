@@ -1406,6 +1406,21 @@ h1 {
   overflow-wrap: anywhere;
   border-color: var(--danger-line);
 }
+.connection-loading {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 16px 18px;
+  margin-bottom: 18px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+  color: var(--text);
+}
+.connection-loading > svg { color: var(--positive); flex-shrink: 0; }
+.connection-loading > div { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.connection-loading strong { font-size: 13px; font-weight: 600; }
+.connection-loading span { color: var(--muted); font-size: 12px; line-height: 1.6; }
 .error-banner > svg {
   flex-shrink: 0;
 }

@@ -21,6 +21,7 @@ const base = `http://127.0.0.1:${port}`;
 const log = fs.openSync(path.join(data, 'server.log'), 'a');
 let server;
 let browser;
+let releaseSlowHealth = () => {};
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 async function waitUntil(fn, message, timeout = 30000) {
   const end = Date.now() + timeout;
@@ -64,6 +65,67 @@ try {
   await page.locator('.drone-marker').first().waitFor();
   await page.getByLabel('Название миссии', { exact: true }).fill('Draft preserved across reconnect');
   await page.getByLabel('Сценарий', { exact: true }).selectOption('patrol');
+  const pause = page.getByRole('button', { name: 'Пауза', exact: true });
+  if (await pause.isVisible()) await pause.click();
+  const beforeSlowHealth = await page.evaluate(() => ({
+    mission: localStorage.getItem('agmen-mission'),
+    frame: document.querySelector('.timecode')?.textContent,
+    markers: [...document.querySelectorAll('.drone-marker')].map(element => element.getAttribute('transform')),
+  }));
+  assert.equal(beforeSlowHealth.markers.length, 5);
+
+  // A slow reachable server is a loading state. Hold real health requests long
+  // enough for the client's own AbortController to time out; never abort the
+  // route as a network failure. Every retry stays held until the test releases it.
+  let holdHealth = true, firstHeldAt = 0, slowHealthAttempts = 0;
+  const heldHealth = new Set();
+  releaseSlowHealth = () => {
+    holdHealth = false;
+    for (const release of heldHealth) release();
+    heldHealth.clear();
+  };
+  await page.route('**/api/health', async route => {
+    slowHealthAttempts += 1;
+    if (!firstHeldAt) firstHeldAt = Date.now();
+    if (holdHealth) await new Promise(resolve => heldHealth.add(resolve));
+    // A request whose client deadline elapsed may already be detached.
+    await route.continue().catch(() => {});
+  });
+  const loading = page.getByRole('status', { name: 'Ожидание ответа сервера', exact: true });
+  await waitUntil(() => firstHeldAt > 0 && Date.now() - firstHeldAt > 2800, 'Health request exceeds its 2500 ms client deadline', 15000);
+  await loading.waitFor({ state: 'visible', timeout: 15000 });
+  assert.equal(await loading.locator('.spin').count() > 0, true, 'Slow-health status includes a loading spinner');
+  assert.equal(await page.getByRole('alert').count(), 0, 'A deadline does not produce the red connection alert');
+  assert.equal(await page.locator('.engine-status.disconnected').count(), 0, 'A deadline does not mark the local engine offline');
+  assert.match(await page.locator('.engine-status').innerText(), /LOCAL ENGINE/);
+  assert.equal(await page.getByLabel('Название миссии', { exact: true }).inputValue(), 'Draft preserved across reconnect');
+  assert.equal(await page.getByLabel('Сценарий', { exact: true }).inputValue(), 'patrol');
+  const duringSlowHealth = await page.evaluate(() => ({
+    mission: localStorage.getItem('agmen-mission'),
+    frame: document.querySelector('.timecode')?.textContent,
+    markers: [...document.querySelectorAll('.drone-marker')].map(element => element.getAttribute('transform')),
+  }));
+  assert.deepEqual(duringSlowHealth, beforeSlowHealth, 'Saved mission and paused frame survive a slow health request');
+  fs.mkdirSync(path.join(root, 'test-results'), { recursive: true });
+  const loadingScreenshots = [];
+  for (const theme of ['light', 'dark']) {
+    if (await page.locator('html').getAttribute('data-theme') !== theme) await page.getByRole('button', { name: 'Сменить тему', exact: true }).click();
+    await waitUntil(async () => await page.locator('html').getAttribute('data-theme') === theme, `${theme} loading theme`);
+    assert.equal(await loading.isVisible(), true);
+    const filename = `connection-slow-health-${theme}.png`;
+    await page.screenshot({ path: path.join(root, 'test-results', filename), fullPage: true });
+    loadingScreenshots.push(filename);
+  }
+  const slowHealthElapsed = Date.now() - firstHeldAt;
+  releaseSlowHealth();
+  await page.unroute('**/api/health');
+  await loading.waitFor({ state: 'hidden', timeout: 30000 });
+  await page.locator('.engine-status').filter({ hasText: 'LOCAL ENGINE' }).waitFor();
+  assert.equal(await page.getByRole('alert').count(), 0);
+  assert.equal(await page.getByLabel('Название миссии', { exact: true }).inputValue(), 'Draft preserved across reconnect');
+  assert.equal(await page.getByLabel('Сценарий', { exact: true }).inputValue(), 'patrol');
+  assert.equal(await page.locator('.drone-marker').count(), 5);
+
   await stop();
   await page.locator('.engine-status.disconnected').waitFor({ timeout: 15000 });
   await page.getByRole('button', { name: 'Повторить подключение', exact: true }).waitFor({ timeout: 15000 });
@@ -101,6 +163,12 @@ try {
     return text;
   }, moduleURL), 'authenticated blob');
   assert.equal(sentToken, 'regression-private-token');
+  await page.evaluate(async url => {
+    const { CONNECTION_EVENT } = await import(url);
+    window.__agmenQAConnectionEvents = 0;
+    window.addEventListener(CONNECTION_EVENT, () => { window.__agmenQAConnectionEvents += 1; });
+  }, moduleURL);
+  const transientEventsBefore = await page.evaluate(() => window.__agmenQAConnectionEvents);
   let getAttempts = 0;
   await page.route('**/api/test-transient', async route => {
     getAttempts++;
@@ -109,6 +177,10 @@ try {
   });
   assert.equal(await page.evaluate(async url => (await (await import(url)).api('/api/test-transient')).ok, moduleURL), true);
   assert.equal(getAttempts, 2, 'Transient GET should retry once');
+  const transientEventsAfter = await page.evaluate(() => window.__agmenQAConnectionEvents);
+  assert.equal(transientEventsAfter, transientEventsBefore, 'A successful GET retry never emits the connection-error event');
+  assert.match(await page.locator('.engine-status').innerText(), /LOCAL ENGINE/);
+  assert.equal(await page.locator('.engine-status.disconnected').count(), 0, 'A transient read keeps the engine online');
   let postAttempts = 0;
   await page.route('**/api/test-write', async route => { postAttempts++; await route.abort('connectionreset'); });
   const postMessage = await page.evaluate(async url => { try { await (await import(url)).api('/api/test-write', { example: true }); } catch (e) { return e.message; } }, moduleURL);
@@ -118,9 +190,10 @@ try {
   const timeoutResult = await page.evaluate(async url => {
     const start = performance.now();
     try { await (await import(url)).api('/api/test-timeout', undefined, { timeoutMs: 150, retries: 0 }); }
-    catch (e) { return { message: e.message, elapsed: performance.now() - start }; }
+    catch (e) { return { message: e.message, elapsed: performance.now() - start, timedOut: e.timedOut }; }
   }, moduleURL);
   assert.match(timeoutResult.message, /не ответил вовремя/);
+  assert.equal(timeoutResult.timedOut, true, 'AbortController deadline is explicitly classified as timedOut');
   assert.ok(timeoutResult.elapsed < 1500, 'Request timeout is bounded');
   for (const status of [401, 403, 422]) {
     await page.route(`**/api/test-status-${status}`, route => route.fulfill({ status, contentType: 'application/json', body: '{"detail":"test detail"}' }));
@@ -129,11 +202,12 @@ try {
     assert.match(message, status === 401 ? /токен/ : status === 403 ? /запретил/ : /параметры/);
   }
   assert.deepEqual(jsErrors, []);
-  const report = { passed: true, isolated_port: port, mission_id: created.id, server_stop_restart: true, initial_boot_failure_recovery: true, draft_preserved: true, mission_restored: true, authenticated_blob: true, get_retry_count: getAttempts, post_attempt_count: postAttempts, timeout_ms: timeoutResult.elapsed, distinct_http_errors: [401, 403, 422], browser_errors: jsErrors };
+  const report = { passed: true, isolated_port: port, mission_id: created.id, slow_health: { attempts: slowHealthAttempts, held_ms: slowHealthElapsed, loading_spinner: true, engine_stayed_online: true, no_red_alert: true, mission_and_frame_preserved: true, draft_preserved: true, recovered: true, screenshots: loadingScreenshots }, server_stop_restart: true, initial_boot_failure_recovery: true, draft_preserved: true, mission_restored: true, authenticated_blob: true, get_retry_count: getAttempts, transient_get_connection_events: transientEventsAfter - transientEventsBefore, transient_get_stayed_online: true, post_attempt_count: postAttempts, timeout_ms: timeoutResult.elapsed, timeout_classified: timeoutResult.timedOut, distinct_http_errors: [401, 403, 422], browser_errors: jsErrors };
   fs.mkdirSync(path.join(root, 'test-results'), { recursive: true });
   fs.writeFileSync(path.join(root, 'test-results/connection-qa.json'), JSON.stringify(report, null, 2));
   console.log(JSON.stringify(report, null, 2));
 } finally {
+  releaseSlowHealth();
   if (browser) await browser.close();
   await stop();
   fs.closeSync(log);
