@@ -49,11 +49,18 @@ class SwarmUNet(nn.Module):
 
 
 def load_model(weights_path: str | Path, device="cpu"):
-    model = SwarmUNet()
     path = Path(weights_path)
-    if path.exists():
-        ckpt = torch.load(path, map_location=device, weights_only=True)
-        model.load_state_dict(ckpt)
+    if not path.is_file():
+        raise FileNotFoundError(f"SwarmUNet weights not found: {path}")
+    model = SwarmUNet()
+    ckpt = torch.load(path, map_location=device, weights_only=True)
+    # Original distributed files contain the state dict directly. Laboratory
+    # checkpoints also retain optimizer/scheduler state for resumable training.
+    if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+        ckpt = ckpt["model_state_dict"]
+    elif isinstance(ckpt, dict) and "state_dict" in ckpt:
+        ckpt = ckpt["state_dict"]
+    model.load_state_dict(ckpt, strict=True)
     model.to(device)
     model.eval()
     return model
