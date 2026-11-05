@@ -1,0 +1,96 @@
+{
+  "simulation_only": true,
+  "config": {
+    "name": "EDGE independent offline example",
+    "drone_count": 10,
+    "controller": "baseline",
+    "scenario": "distribution",
+    "steps": 150,
+    "seed": 42,
+    "max_speed": 5.0,
+    "safe_distance": 1.5,
+    "obstacle": "none"
+  },
+  "scope": "One assigned virtual vehicle, original controller, no peer observations",
+  "results": [
+    {
+      "mode": "ONLINE",
+      "step": 80,
+      "position_m": [
+        54.95554276932344,
+        20.69165964262224
+      ],
+      "status": "running",
+      "battery_model_percent": 99.27864172283232,
+      "metrics": {
+        "distance_to_target_m": 3.359128325800159,
+        "task_fraction": 0.9399846699913686,
+        "task_completion_fraction": 0.0,
+        "distribution_mae": 0.002887438875898689,
+        "distribution_scope": "own_local_position",
+        "constraint_violations": 0,
+        "emergency_stops": 0,
+        "recovery_steps": null,
+        "radio_outage_steps": null,
+        "recovery_time_s": null
+      },
+      "journal_entries": 81,
+      "compute_and_persist_ms": 435.5883999960497,
+      "last_confirmed_step": 80,
+      "telemetry_stale": false
+    },
+    {
+      "mode": "OFFLINE",
+      "step": 80,
+      "position_m": [
+        54.95554276932344,
+        20.69165964262224
+      ],
+      "status": "running",
+      "battery_model_percent": 99.27864172283232,
+      "metrics": {
+        "distance_to_target_m": 3.359128325800159,
+        "task_fraction": 0.9399846699913686,
+        "task_completion_fraction": 0.0,
+        "distribution_mae": 0.002887438875898689,
+        "distribution_scope": "own_local_position",
+        "constraint_violations": 0,
+        "emergency_stops": 0,
+        "recovery_steps": null,
+        "radio_outage_steps": null,
+        "recovery_time_s": null
+      },
+      "journal_entries": 82,
+      "compute_and_persist_ms": 429.57679997198284,
+      "last_confirmed_step": 80,
+      "telemetry_stale": false
+    },
+    {
+      "mode": "LINK_LOST",
+      "step": 80,
+      "position_m": [
+        54.95554276932344,
+        20.69165964262224
+      ],
+      "status": "running",
+      "battery_model_percent": 99.27864172283232,
+      "metrics": {
+        "distance_to_target_m": 3.359128325800159,
+        "task_fraction": 0.9399846699913686,
+        "task_completion_fraction": 0.0,
+        "distribution_mae": 0.002887438875898689,
+        "distribution_scope": "own_local_position",
+        "constraint_violations": 0,
+        "emergency_stops": 0,
+        "recovery_steps": null,
+        "radio_outage_steps": null,
+        "recovery_time_s": null
+      },
+      "journal_entries": 83,
+      "compute_and_persist_ms": 439.2241999739781,
+      "last_confirmed_step": 20,
+      "telemetry_stale": true
+    }
+  ],
+  "same_independent_trajectory_endpoint": true
+}

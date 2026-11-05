@@ -1,0 +1,6 @@
+# Optional original Gradio and MAVLink tools; not required by the AGMEN simulator.
+-r requirements-runtime.txt
+gradio>=5,<7
+python-docx>=1.1,<2
+pymavlink>=2.4.49,<3
+scikit-learn>=1.4,<2
