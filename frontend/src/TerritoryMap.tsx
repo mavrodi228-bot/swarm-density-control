@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { ChangeEvent, PointerEvent } from "react";
 import { Circle, ImagePlus, LoaderCircle, Map, MousePointer2, Pentagon, ScanSearch, Square, Trash2, Undo2, Check, X, RotateCcw } from "lucide-react";
-import { api, requestBlob } from "./api";
+import { api, appStorageKey, requestBlob } from "./api";
 
 export type MapPoint = { x: number; y: number };
 export type RestrictedZone = {
@@ -45,7 +45,7 @@ const empty = (storageKey: string): StoredTerritory => {
   catch { return { map_id: null, restricted_zones: [] }; }
 };
 
-export function useTerritory(onError: (message: string) => void, online: boolean, onEdit?: (reason: TerritoryEditReason) => void, storageKey = "agmen-territory") {
+export function useTerritory(onError: (message: string) => void, online: boolean, onEdit?: (reason: TerritoryEditReason) => void, storageKey = appStorageKey("agmen-territory")) {
   const [initial] = useState(() => empty(storageKey));
   const [maps, setMaps] = useState<Territory[]>([]);
   const [map, setMap] = useState<Territory | null>(null);

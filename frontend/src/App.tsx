@@ -1,6 +1,6 @@
 import { cloneElement, isValidElement, useEffect, useRef, useState } from "react";
 import type { ReactElement, ReactNode } from "react";
-import { api, download, CONNECTION_EVENT, ApiError, isTimeoutMessage } from "./api";
+import { api, appStorageKey, download, CONNECTION_EVENT, ApiError, DEMO_MODE, isTimeoutMessage } from "./api";
 import { useTerritory, TerritoryPanel, TerritoryBackground, TerritoryLayers } from "./TerritoryMap";
 import type { RestrictedZone } from "./TerritoryMap";
 import { ArrivalStage } from "./ArrivalStage";
@@ -170,15 +170,15 @@ type Device = {
 };
 type EdgePackage = { id: string; drone_id: number; mission_id: string };
 const defaults: Config = {
-  name: "Миссия «Горизонт»",
-  drone_count: 48,
+  name: DEMO_MODE ? "Демо · Целевые области" : "Миссия «Горизонт»",
+  drone_count: DEMO_MODE ? 12 : 48,
   controller: "baseline",
   scenario: "clusters",
-  steps: 120,
+  steps: DEMO_MODE ? 80 : 120,
   seed: 42,
   max_speed: 3,
   safe_distance: 1.2,
-  obstacle: "central",
+  obstacle: DEMO_MODE ? "none" : "central",
   wait_for_arrival: true,
 };
 const labels: Record<string, string> = {
@@ -355,9 +355,9 @@ function Chart({
 function App() {
   const [page, setPage] = useState("mission");
   const [theme, setTheme] = useState(() =>
-    localStorage.getItem("agmen-theme") === "dark" ? "dark" : "light",
+    localStorage.getItem(appStorageKey("agmen-theme")) === "dark" ? "dark" : "light",
   );
-  const [pro, setPro] = useState(localStorage.getItem("agmen-pro") === "true");
+  const [pro, setPro] = useState(localStorage.getItem(appStorageKey("agmen-pro")) === "true");
   const [boot, setBoot] = useState<Bootstrap | null>(null);
   const [mission, setMission] = useState<Mission | null>(null);
   const [missions, setMissions] = useState<Mission[]>([]);
@@ -365,12 +365,12 @@ function App() {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [online, setOnline] = useState(false);
-  const hasTerrainDraft = useRef(localStorage.getItem("agmen-territory") !== null);
+  const hasTerrainDraft = useRef(localStorage.getItem(appStorageKey("agmen-territory")) !== null);
   const territory = useTerritory(setError, online, (reason) => {
     setMission(null); setPlaying(false); setFrameIndex(0);
     missionRef.current = null;
     missionSelection.current += 1;
-    localStorage.removeItem("agmen-mission");
+    localStorage.removeItem(appStorageKey("agmen-mission"));
     hasTerrainDraft.current = true;
     setSelected([]); setDrawing(null); drag.current = null;
     if (reason === "map" || reason === "reset") {
@@ -436,7 +436,7 @@ function App() {
     unknown
   > | null>(null);
   const [token, setToken] = useState(
-    sessionStorage.getItem("agmen-token") || "",
+    DEMO_MODE ? "" : sessionStorage.getItem("agmen-token") || "",
   );
   const frames = mission?.frames || [];
   const frame = frames[Math.min(frameIndex, frames.length - 1)];
@@ -453,10 +453,10 @@ function App() {
   const waitingForResponse = responsePending || isTimeoutMessage(error);
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
-    localStorage.setItem("agmen-theme", theme);
+    localStorage.setItem(appStorageKey("agmen-theme"), theme);
   }, [theme]);
   useEffect(() => {
-    localStorage.setItem("agmen-pro", String(pro));
+    localStorage.setItem(appStorageKey("agmen-pro"), String(pro));
   }, [pro]);
   useEffect(() => {
     let live = true;
@@ -482,8 +482,8 @@ function App() {
           setMissions(b.missions || []);
           const current = missionRef.current;
           const selection = missionSelection.current;
-          const saved = current?.id || localStorage.getItem("agmen-mission");
-          const initial = b.missions?.find((m) => m.id === saved) || (!initialized ? b.missions?.[0] : undefined);
+          const saved = current?.id || localStorage.getItem(appStorageKey("agmen-mission"));
+          const initial = b.missions?.find((m) => m.id === saved) || (!initialized && !DEMO_MODE ? b.missions?.[0] : undefined);
           if (initial) {
             const m = await api<Mission>(`/api/missions/${initial.id}`);
             if (!live) return;
@@ -615,7 +615,7 @@ function App() {
     return () => clearTimeout(t);
   }, [toast]);
   useEffect(() => {
-    if (page !== "lab" || !online) return;
+    if (DEMO_MODE || page !== "lab" || !online) return;
     let live = true;
     const refresh = async () => {
       try {
@@ -744,7 +744,7 @@ function App() {
       });
       setFrameIndex(0);
       setSelected([]);
-      localStorage.setItem("agmen-mission", m.id);
+      localStorage.setItem(appStorageKey("agmen-mission"), m.id);
       setMissions((prev) => [m, ...prev.filter((x) => x.id !== m.id)]);
       if (m.status === "completed") {
         if (m.config) territory.restore(m.config.map_id, m.config.restricted_zones, m.workspace);
@@ -770,7 +770,7 @@ function App() {
         setZones(m.config.targets || []);
         territory.restore(m.config.map_id, m.config.restricted_zones, m.workspace);
       }
-      localStorage.setItem("agmen-mission", id);
+      localStorage.setItem(appStorageKey("agmen-mission"), id);
     } catch (e) {
       setError((e as Error).message);
     }
@@ -788,7 +788,7 @@ function App() {
       });
     }
     setMissions(previous => [next, ...previous.filter(value => value.id !== next.id)]);
-    localStorage.setItem("agmen-mission", next.id);
+    localStorage.setItem(appStorageKey("agmen-mission"), next.id);
     setToast("Продолжение начато из сохранённых позиций группы.");
     requestAnimationFrame(() => mapRef.current?.closest(".map-panel")?.scrollIntoView({ behavior: "smooth", block: "start" }));
   }
@@ -851,6 +851,7 @@ function App() {
     setDrawing(null);
   }
   async function train() {
+    if (DEMO_MODE) return;
     setBusy(true);
     setError("");
     try {
@@ -881,8 +882,9 @@ function App() {
     { id: "edge", label: "AGMEN EDGE", icon: Cpu },
     { id: "lab", label: "AI лаборатория", icon: FlaskConical },
     { id: "analytics", label: "Аналитика", icon: BarChart3 },
-  ];
+  ].filter((item) => !DEMO_MODE || item.id !== "lab");
   const navigation = (id: string) => {
+    if (DEMO_MODE && id === "lab") return;
     setPage(id);
     setError("");
   };
@@ -943,19 +945,19 @@ function App() {
       <div className="workspace">
         <header className="topbar">
           <div className="brand">
-            AGMEN<span>SWARM INTELLIGENCE</span>
+            AGMEN<span>{DEMO_MODE ? "ДЕМО ДЛЯ ЖЮРИ" : "SWARM INTELLIGENCE"}</span>
           </div>
           <div className="breadcrumb">
-            Рабочее пространство
+            {DEMO_MODE ? "Демо для жюри" : "Рабочее пространство"}
             <ChevronRight size={13} />
             <strong>
               {nav.find((n) => n.id === page)?.label || "Настройки"}
             </strong>
           </div>
           <div className="top-actions">
-            <span className={`engine-status ${online ? "" : waitingForResponse || reconnecting ? "pending" : "disconnected"}`} role="status" title="Соединение браузера с локальным сервером AGMEN; не связано с интернетом EDGE">
+            <span className={`engine-status ${online ? "" : waitingForResponse || reconnecting ? "pending" : "disconnected"}`} role="status" title={DEMO_MODE ? "Соединение с демонстрационным контуром AGMEN" : "Соединение браузера с локальным сервером AGMEN; не связано с интернетом EDGE"}>
               <i />
-              {online ? "LOCAL ENGINE" : waitingForResponse ? "ОЖИДАНИЕ ОТВЕТА…" : reconnecting ? "ПОДКЛЮЧЕНИЕ…" : "НЕТ СОЕДИНЕНИЯ"}
+              {online ? DEMO_MODE ? "DEMO ENGINE" : "LOCAL ENGINE" : waitingForResponse ? "ОЖИДАНИЕ ОТВЕТА…" : reconnecting ? "ПОДКЛЮЧЕНИЕ…" : "НЕТ СОЕДИНЕНИЯ"}
             </span>
             <div className="mode-switch">
               <button
@@ -1001,7 +1003,7 @@ function App() {
               </h1>
               <p>
                 {page === "mission"
-                  ? "От целевого распределения — к согласованному движению роя."
+                  ? DEMO_MODE ? "Готовый рой из 12 аппаратов. Рассчитайте миссию, исследуйте карту и продолжите следующий этап." : "От целевого распределения — к согласованному движению роя."
                   : page === "edge"
                     ? "Миссия на борту. Локальное выполнение. Независимость от сети."
                     : page === "lab"
@@ -1012,10 +1014,11 @@ function App() {
               </p>
             </div>
             <div className="heading-meta">
+              {DEMO_MODE && <span className="demo-badge">Демо для жюри</span>}
               <span className="small-badge">
                 <ShieldCheck size={13} /> СИМУЛЯЦИЯ
               </span>
-              <span className="version">WORKSPACE / 01</span>
+              {!DEMO_MODE && <span className="version">WORKSPACE / 01</span>}
             </div>
           </div>
           {waitingForResponse && !connectionIssue && <div className="connection-loading" role="status" aria-live="polite" aria-label="Ожидание ответа сервера">
@@ -2135,7 +2138,7 @@ function App() {
               </section>
             </>
           )}
-          {page === "lab" && (
+          {!DEMO_MODE && page === "lab" && (
             <>
               <div className="lab-intro">
                 <div className="lab-intro-icon">
@@ -3298,7 +3301,7 @@ function App() {
                     <i />
                   </button>
                 </div>
-                <div className="setting-row token-row">
+                {!DEMO_MODE && <div className="setting-row token-row">
                   <div>
                     <strong>Токен частного сервера</strong>
                     <p>Хранится только до закрытия вкладки</p>
@@ -3322,7 +3325,7 @@ function App() {
                       Подключить
                     </button>
                   </div>
-                </div>
+                </div>}
                 <div className="setting-row">
                   <div>
                     <strong>Сбросить параметры миссии</strong>

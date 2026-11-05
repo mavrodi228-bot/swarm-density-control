@@ -166,7 +166,12 @@ def _store(request: Request) -> Store:
     with _INIT_LOCK:
         store = getattr(request.app.state, "edge_store", None)
         if store is None:
-            root = Path(os.getenv("AGMEN_DATA_DIR", os.getenv("AGMEN_STATE_DIR", str(Path(__file__).resolve().parent.parent / "data"))))
+            # The mounted jury demo supplies its own storage root. Never fall
+            # back to the private app's environment when that root is present.
+            root = getattr(request.app.state, "data_directory", None)
+            if root is None:
+                root = Path(os.getenv("AGMEN_DATA_DIR", os.getenv("AGMEN_STATE_DIR", str(Path(__file__).resolve().parent.parent / "data"))))
+            root = Path(root)
             store = Store(root / "edge", request.app.state.agmen_profile)
             request.app.state.edge_store = store
         return store

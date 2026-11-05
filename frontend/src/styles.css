@@ -1,4 +1,16 @@
 /* AGMEN · Field Notes. Chalk, oxide and olive. All surfaces share theme tokens. */
+.demo-badge {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--accent-line);
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-radius: 4px;
+  padding: 5px 8px;
+  font-size: 9px;
+  font-weight: 600;
+  white-space: nowrap;
+}
 :root {
   font-family: "Aptos", "Segoe UI Variable Text", "Segoe UI", sans-serif;
   font-size: 14px;

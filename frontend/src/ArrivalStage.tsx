@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { PointerEvent } from "react";
 import { ArrowRight, Check, Crosshair, LoaderCircle, Map, Route, ScanLine, Target, Waypoints } from "lucide-react";
-import { api } from "./api";
+import { api, appStorageKey } from "./api";
 import { TerritoryBackground, TerritoryLayers, TerritoryPanel, useTerritory } from "./TerritoryMap";
 
 export type Arrival = {
@@ -33,8 +33,8 @@ type Props = {
 const icons = [Target, Route, Crosshair, ScanLine];
 
 export function ArrivalStage({ mission, online, atArrival, onJumpToArrival, onError, onCreated }: Props) {
-  const storageKey = `agmen-destination-${mission.id}`;
-  const planKey = `agmen-stage-plan-${mission.id}`;
+  const storageKey = appStorageKey(`agmen-destination-${mission.id}`);
+  const planKey = appStorageKey(`agmen-stage-plan-${mission.id}`);
   const existingMap = useRef(localStorage.getItem(storageKey) !== null).current;
   const initialPlan = useRef((() => {
     try { return JSON.parse(localStorage.getItem(planKey) || "null"); } catch { return null; }

@@ -135,19 +135,23 @@ def _controllers():
     return [{"id": k, "label": v, "available": k == "baseline" or available} for k, v in CONTROLLERS.items()]
 
 
-def create_app(state_dir: str | Path | None = None) -> FastAPI:
+def create_app(state_dir: str | Path | None = None, *, profile: str | None = None,
+               data_dir: str | Path | None = None, enable_demo: bool = True,
+               _demo: bool = False, _resources: tuple | None = None,
+               _dev_origins: bool = False) -> FastAPI:
     app = FastAPI(title="AGMEN Simulation API", version="1.0.0")
     configured_hosts = [host.strip() for host in os.getenv("AGMEN_ALLOWED_HOSTS", "").split(",") if host.strip()]
     # External deployment domains extend the local health-check hosts. Docker
     # and the desktop launcher must still reach the service through loopback.
     allowed_hosts = list(dict.fromkeys(["localhost", "127.0.0.1", "testserver", *configured_hosts]))
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts, www_redirect=False)
-    data_directory = Path(os.getenv("AGMEN_DATA_DIR", os.getenv("AGMEN_STATE_DIR", str(ROOT / "data"))))
+    data_directory = Path(data_dir or os.getenv("AGMEN_DATA_DIR", os.getenv("AGMEN_STATE_DIR", str(ROOT / "data"))))
+    app.state.data_directory = data_directory
     directory = Path(state_dir) if state_dir is not None else data_directory / "missions"
     directory.mkdir(parents=True, exist_ok=True)
     maps = MapStore((Path(state_dir) / "maps") if state_dir is not None else data_directory / "maps")
     app.state.maps = maps
-    profile_name = os.getenv("AGMEN_PROFILE", "local").lower()
+    profile_name = (profile or os.getenv("AGMEN_PROFILE", "local")).strip().lower()
     if profile_name == "demo":
         profile_name = "public"
     if profile_name not in {"local", "private", "public"}:
@@ -160,13 +164,35 @@ def create_app(state_dir: str | Path | None = None) -> FastAPI:
               "max_jobs": 3, "max_missions": 20}
     profile = {"name": profile_name, "simulation_only": True,
                "token_required": profile_name == "private", "limits": limits,
-               "training_allowed": profile_name != "public"}
+               "training_allowed": profile_name != "public", "demo": _demo,
+               "api_base": "/demo/api" if _demo else "/api"}
     lock = threading.RLock()
-    plot_lock = threading.Lock()
-    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="agmen-sim")
-    capacity = threading.BoundedSemaphore(limits["max_jobs"])
+    executor, capacity, plot_lock = _resources or (
+        ThreadPoolExecutor(max_workers=1, thread_name_prefix="agmen-sim"),
+        threading.BoundedSemaphore(limits["max_jobs"]), threading.Lock())
     records: dict[str, dict] = {}
     app.state.records, app.state.executor = records, executor
+    app.state.compute_resources = (executor, capacity, plot_lock)
+
+    def public_payload(value):
+        """Keep persisted URLs canonical and adapt demo URLs only on output."""
+        if not _demo:
+            return value
+        if isinstance(value, dict):
+            result = dict(value)
+            image_url = result.get("image_url")
+            if isinstance(image_url, str) and image_url.startswith("/api/maps/"):
+                result["image_url"] = "/demo" + image_url
+            for key, child in result.items():
+                # Large numeric arrays contain no map metadata. Preserve their
+                # references while copying the small metadata dictionaries.
+                if key not in {"frames", "history", "density", "target", "obstacle", "flux_x", "flux_y", "agents"}:
+                    if isinstance(child, (dict, list)):
+                        result[key] = public_payload(child)
+            return result
+        if isinstance(value, list):
+            return [public_payload(child) for child in value]
+        return value
 
     def persist(record: dict):
         target = directory / f"{record['id']}.json"
@@ -190,8 +216,12 @@ def create_app(state_dir: str | Path | None = None) -> FastAPI:
 
     @app.middleware("http")
     async def guard(request: Request, call_next):
-        if request.url.path.startswith("/api/"):
-            if profile_name == "private" and request.url.path != "/api/health":
+        request_path = request.scope["path"]
+        root_path = request.scope.get("root_path", "")
+        if root_path and request_path.startswith(root_path):
+            request_path = request_path[len(root_path):] or "/"
+        if request_path.startswith("/api/"):
+            if profile_name == "private" and request_path != "/api/health":
                 received = request.headers.get("x-agmen-token", "")
                 if not received:
                     received = request.headers.get("authorization", "").removeprefix("Bearer ")
@@ -200,13 +230,15 @@ def create_app(state_dir: str | Path | None = None) -> FastAPI:
             if request.method in {"POST", "PUT", "PATCH"}:
                 origin = request.headers.get("origin")
                 if origin:
-                    accepted_origins = {str(request.base_url).rstrip("/")}
+                    # A mounted app's base_url includes /demo, while a browser
+                    # Origin contains only scheme and authority.
+                    accepted_origins = {f"{request.url.scheme}://{request.url.netloc}"}
                     accepted_origins.update(value.strip().rstrip("/") for value in os.getenv("AGMEN_ALLOWED_ORIGINS", "").split(",") if value.strip())
-                    if profile_name == "local":
+                    if profile_name == "local" or _dev_origins:
                         accepted_origins.update({"http://localhost:5173", "http://127.0.0.1:5173"})
                     if origin.rstrip("/") not in accepted_origins:
                         return JSONResponse({"detail": "Cross-origin writes are not permitted."}, status_code=403)
-                body_limit = 8 * 1024 * 1024 if request.method == "POST" and request.url.path == "/api/maps" else 256_000
+                body_limit = 8 * 1024 * 1024 if request.method == "POST" and request_path == "/api/maps" else 256_000
                 chunks, length = [], 0
                 async for chunk in request.stream():
                     length += len(chunk)
@@ -231,11 +263,13 @@ def create_app(state_dir: str | Path | None = None) -> FastAPI:
     app.state.get_mission = lambda identifier: get_record(identifier, "mission")
 
     def brief(record: dict) -> dict:
-        return {key: record.get(key) for key in ("id", "name", "kind", "status", "created_at", "updated_at", "config", "summary", "arrival", "progress", "workspace", "stage", "parent_id", "error", "results", "best") if key in record}
+        return public_payload({key: record.get(key) for key in ("id", "name", "kind", "status", "created_at", "updated_at", "config", "summary", "arrival", "progress", "workspace", "stage", "parent_id", "error", "results", "best") if key in record})
 
     def check_config(config: dict, *, resolve_map=True):
         if config["drone_count"] > limits["max_drones"] or config["steps"] > limits["max_steps"]:
             raise HTTPException(422, f"{profile_name} profile permits at most {limits['max_drones']} drones and {limits['max_steps']} steps")
+        if _demo and config.get("model_id", "bundled") != "bundled":
+            raise HTTPException(422, "The jury demo uses only the bundled model; private checkpoints are unavailable.")
         _inference(config["controller"], config.get("model_id", "bundled"))
         if config.get("wait_for_arrival"):
             config["max_completion_steps"] = 600 if profile_name == "public" else 1200
@@ -293,13 +327,38 @@ def create_app(state_dir: str | Path | None = None) -> FastAPI:
     app.state.submit_background = submit_background
     app.state.agmen_profile = profile
 
+    def demo_eviction(kind: str, metadata: dict | None):
+        protected = set()
+        # Keep the parent chain needed by the requested stage, and every active
+        # job's ancestors, while rotating only terminal demo records.
+        sources = [r["id"] for r in records.values() if r.get("status") in {"queued", "running"}]
+        if metadata and metadata.get("parent_id"):
+            sources.append(metadata["parent_id"])
+        for source in sources:
+            while source and source not in protected:
+                protected.add(source)
+                source = (records.get(source) or {}).get("parent_id")
+        candidates = [r for r in records.values() if r["kind"] == kind and r["id"] not in protected
+                      and r.get("status") in {"completed", "failed"}]
+        return min(candidates, key=lambda r: r["created_at"]) if candidates else None
+
     def enqueue(kind: str, name: str, config: dict, work, metadata: dict | None = None, *, track_progress=False) -> dict:
         memory_admission()
         with lock:
+            eviction = None
             if sum(r["kind"] == kind for r in records.values()) >= limits["max_missions"]:
-                raise HTTPException(409, "Saved run limit reached. Archive state files before starting further runs.")
+                eviction = demo_eviction(kind, metadata) if _demo else None
+                if eviction is None:
+                    raise HTTPException(409, "Saved run limit reached. Archive state files before starting further runs.")
             if not capacity.acquire(blocking=False):
                 raise HTTPException(429, "Simulation queue is full. Wait for an active run to finish.")
+            if eviction is not None:
+                try:
+                    (directory / f"{eviction['id']}.json").unlink(missing_ok=True)
+                except OSError as error:
+                    capacity.release()
+                    raise HTTPException(507, "Unable to rotate the demo archive") from error
+                records.pop(eviction["id"])
             identifier = uuid.uuid4().hex[:12]
             record = {"id": identifier, "kind": kind, "name": name, "status": "queued",
                       "config": config, "created_at": now(), "updated_at": now(), **(metadata or {})}
@@ -344,7 +403,7 @@ def create_app(state_dir: str | Path | None = None) -> FastAPI:
 
     @app.get("/api/health")
     def health():
-        return {"status": "ok", "app": "AGMEN", "service": "AGMEN", "version": "1.0.0", "simulation_only": True, "profile": profile_name}
+        return {"status": "ok", "app": "AGMEN", "service": "AGMEN", "version": "1.0.0", "simulation_only": True, "profile": profile_name, "demo": _demo}
 
     @app.get("/api/bootstrap")
     def bootstrap():
@@ -356,12 +415,12 @@ def create_app(state_dir: str | Path | None = None) -> FastAPI:
 
     @app.get("/api/maps")
     def list_maps():
-        return maps.list()
+        return public_payload(maps.list())
 
     @app.post("/api/maps", status_code=201)
     def upload_map(upload: MapUpload):
         try:
-            return maps.create(upload)
+            return public_payload(maps.create(upload))
         except ValueError as error:
             raise HTTPException(422, str(error)) from error
         except OSError as error:
@@ -370,7 +429,7 @@ def create_app(state_dir: str | Path | None = None) -> FastAPI:
     @app.get("/api/maps/{identifier}")
     def get_map(identifier: str):
         try:
-            return maps.get(identifier)
+            return public_payload(maps.get(identifier))
         except FileNotFoundError as error:
             raise HTTPException(404, "Territory not found") from error
 
@@ -382,7 +441,7 @@ def create_app(state_dir: str | Path | None = None) -> FastAPI:
     @app.post("/api/maps/{identifier}/analyze")
     def analyze_map(identifier: str, settings: MapAnalysis):
         try:
-            return maps.analyze(identifier, settings)
+            return public_payload(maps.analyze(identifier, settings))
         except FileNotFoundError as error:
             raise HTTPException(404, "Territory not found") from error
         except OSError as error:
@@ -391,7 +450,7 @@ def create_app(state_dir: str | Path | None = None) -> FastAPI:
     @app.post("/api/maps/{identifier}/calibrate")
     def calibrate_map(identifier: str, dimensions: MapCalibration):
         try:
-            return maps.calibrate(identifier, dimensions)
+            return public_payload(maps.calibrate(identifier, dimensions))
         except FileNotFoundError as error:
             raise HTTPException(404, "Territory not found") from error
         except OSError as error:
@@ -416,14 +475,14 @@ def create_app(state_dir: str | Path | None = None) -> FastAPI:
             snapshot = dict(get_record(identifier))
         # Encode large frame histories in this sync handler's worker thread.
         # Returning a dict makes FastAPI traverse it on the event loop instead.
-        return JSONResponse(snapshot)
+        return JSONResponse(public_payload(snapshot))
 
     @app.get("/api/missions/{identifier}/next-stage-options")
     def next_stage_options(identifier: str):
         with lock:
             record = copy.deepcopy(get_record(identifier))
             children = [brief(r) for r in records.values() if r.get("parent_id") == identifier]
-        return stage_options(record, children)
+        return public_payload(stage_options(record, children))
 
     def queue_continuation(data: dict, stage: dict, *, check_reachability: bool):
         check_config(data, resolve_map=False)
@@ -511,7 +570,7 @@ def create_app(state_dir: str | Path | None = None) -> FastAPI:
         filename = f"agmen-{identifier}.{format}"
         headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
         if format == "json":
-            return Response(json.dumps(record, ensure_ascii=False, allow_nan=False), media_type="application/json", headers=headers)
+            return Response(json.dumps(public_payload(record), ensure_ascii=False, allow_nan=False), media_type="application/json", headers=headers)
         if format == "csv":
             stream = io.StringIO(newline="")
             writer = csv.DictWriter(stream, fieldnames=list(record["history"][0]))
@@ -592,17 +651,41 @@ def create_app(state_dir: str | Path | None = None) -> FastAPI:
                     "summary": {"method": "bounded grid search of original slot_gain", "objective": "final MAE", "evaluations": len(results)}}
         return enqueue("optimization", "Оптимизация baseline", config.model_dump(), work)
 
-    try:
-        from ml_lab import router
-        app.include_router(router)
-    except ImportError as exc:
-        LOG.warning("ML Laboratory is unavailable: %s", exc)
+    if _demo:
+        @app.get("/api/lab/models")
+        def demo_models():
+            available = next(item["available"] for item in _controllers() if item["id"] == "neural")
+            return [{"id": "bundled", "name": "SwarmUNet · bundled", "source": "bundled",
+                     "available": available, "validated": False, "architecture": "SwarmUNet",
+                     "hardware_promoted": False, "validation_note": "Bundled demonstration weights; not flight-qualified."}]
+
+        @app.get("/api/lab/runs")
+        def demo_runs():
+            return []
+
+        @app.api_route("/api/lab/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
+        def demo_lab_disabled(path: str):
+            raise HTTPException(403, "Training and private model artifacts are unavailable in the jury demo.")
+    else:
+        try:
+            from ml_lab import router
+            app.include_router(router)
+        except ImportError as exc:
+            LOG.warning("ML Laboratory is unavailable: %s", exc)
 
     try:
         from edge.api import router as edge_router
         app.include_router(edge_router)
     except ImportError as exc:
         LOG.warning("EDGE module is unavailable: %s", exc)
+
+    if enable_demo:
+        demo_directory = (Path(state_dir) / "demo") if state_dir is not None and data_dir is None else data_directory / "demo"
+        demo_app = create_app(profile="public", data_dir=demo_directory, enable_demo=False,
+                              _demo=True, _resources=app.state.compute_resources,
+                              _dev_origins=profile_name == "local")
+        app.state.demo_app = demo_app
+        app.mount("/demo", demo_app, name="jury-demo")
 
     dist = ROOT / "frontend" / "dist"
 

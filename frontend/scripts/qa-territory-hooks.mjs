@@ -48,7 +48,7 @@ const context = {
     if (name === 'react') return react;
     if (name === 'react/jsx-runtime') return { jsx() {}, jsxs() {} };
     if (name === 'lucide-react') return new Proxy({}, { get() { return function Icon() {}; } });
-    if (name === './api') return { api, requestBlob: async () => new Blob(['fixture PNG']) };
+    if (name === './api') return { api, appStorageKey: key => key, requestBlob: async () => new Blob(['fixture PNG']) };
     throw new Error(name);
   },
   localStorage: { getItem: key => storage.get(key) || null, setItem: (key, value) => storage.set(key, value) },

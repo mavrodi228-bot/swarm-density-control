@@ -1,5 +1,11 @@
-export const CONNECTION_EVENT = "agmen:connection-error";
+export const DEMO_MODE = typeof window !== "undefined" && /^\/demo(?:\/|$)/.test(window.location.pathname);
+export const CONNECTION_EVENT = DEMO_MODE ? "agmen:demo:connection-error" : "agmen:connection-error";
 const TIMEOUT_MESSAGE = "Сервер не ответил вовремя";
+
+// A demo tab has its own drafts and preferences, even on a private workstation.
+export const appStorageKey = (key: string) => DEMO_MODE && !key.startsWith("agmen-demo-")
+  ? key.replace(/^agmen-/, "agmen-demo-")
+  : key;
 
 // Editors also forward plain error messages to the application's banner.
 export const isTimeoutMessage = (message: string) => message.startsWith(`${TIMEOUT_MESSAGE} (`);
@@ -21,8 +27,23 @@ type RequestOptions = { timeoutMs?: number; retries?: number };
 const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function authHeaders(): Record<string, string> {
+  if (DEMO_MODE) return {};
   const token = sessionStorage.getItem("agmen-token");
   return token ? { "X-AGMEN-Token": token } : {};
+}
+
+export function apiPath(path: string): string {
+  const prefix = DEMO_MODE ? "/demo/api/" : "/api/";
+  const relative = path.startsWith("/api/") ? path.slice(5)
+    : DEMO_MODE && path.startsWith(prefix) ? path.slice(prefix.length)
+      : undefined;
+  if (relative === undefined) throw new ApiError("Некорректный адрес API", path);
+  const scoped = new URL(`${prefix}${relative}`, window.location.origin);
+  // Reject normalization that could leave this application's API namespace.
+  if (scoped.origin !== window.location.origin || !scoped.pathname.startsWith(prefix)) {
+    throw new ApiError("Некорректный адрес API", path);
+  }
+  return `${scoped.pathname}${scoped.search}`;
 }
 
 function reportConnectionError(error: ApiError) {
@@ -43,7 +64,7 @@ async function httpError(response: Response, path: string): Promise<ApiError> {
     }
   } catch { /* A reverse proxy may return an HTML error page. */ }
   const reason = response.status === 401
-    ? "Сервер доступен. Укажите действующий токен в настройках платформы."
+    ? DEMO_MODE ? "Демонстрационный режим временно недоступен. Обновите страницу или повторите позже." : "Сервер доступен. Укажите действующий токен в настройках платформы."
     : response.status === 403
       ? "Сервер запретил действие. Проверьте права и адрес приложения."
       : response.status === 422
@@ -62,10 +83,8 @@ async function request<T>(
   read: (response: Response) => Promise<T>,
   options: RequestOptions = {},
 ): Promise<T> {
-  // Only relative API routes are accepted, so credentials stay on this origin.
-  if (!path.startsWith("/api/") || path.startsWith("//")) {
-    throw new ApiError("Некорректный адрес API", path);
-  }
+  // Namespace every JSON request, image and download at the same boundary.
+  const scopedPath = apiPath(path);
   const isRead = body === undefined;
   const attempts = 1 + (isRead ? (options.retries ?? 1) : 0);
   for (let attempt = 0; attempt < attempts; attempt++) {
@@ -73,25 +92,25 @@ async function request<T>(
     const timeout = window.setTimeout(() => controller.abort(), options.timeoutMs ?? (isRead ? 8000 : 20000));
     let failure: ApiError | undefined;
     try {
-      const response = await fetch(path, {
+      const response = await fetch(scopedPath, {
         method: isRead ? "GET" : "POST",
         headers: { ...authHeaders(), ...(isRead ? {} : { "Content-Type": "application/json" }) },
         body: isRead ? undefined : JSON.stringify(body),
         signal: controller.signal,
         cache: "no-store",
-        credentials: "same-origin",
+        credentials: DEMO_MODE ? "omit" : "same-origin",
       });
-      if (!response.ok) throw await httpError(response, path);
+      if (!response.ok) throw await httpError(response, scopedPath);
       return await read(response);
     } catch (error) {
       if (error instanceof ApiError) failure = error;
       else {
         const timedOut = controller.signal.aborted;
-        const reason = timedOut ? TIMEOUT_MESSAGE : "Нет соединения с локальным сервером";
+        const reason = timedOut ? TIMEOUT_MESSAGE : DEMO_MODE ? "Нет соединения с демонстрационным сервером" : "Нет соединения с локальным сервером";
         const instruction = isRead
-          ? timedOut ? "Ответ задерживается. Ожидание продолжится автоматически." : "Запустите RUN_AGMEN.cmd. Подключение восстановится автоматически."
+          ? timedOut ? "Ответ задерживается. Ожидание продолжится автоматически." : DEMO_MODE ? "Проверьте соединение. Подключение восстановится автоматически." : "Запустите RUN_AGMEN.cmd. Подключение восстановится автоматически."
           : "Результат команды неизвестен. После восстановления связи проверьте список задач перед повторным запуском.";
-        failure = new ApiError(`${reason} (${path}). ${instruction}`, path, undefined, true, timedOut);
+        failure = new ApiError(`${reason} (${scopedPath}). ${instruction}`, scopedPath, undefined, true, timedOut);
       }
       const retryable = failure.transport || [502, 503, 504].includes(failure.status ?? 0);
       if (!retryable || attempt === attempts - 1) {
